@@ -30,6 +30,21 @@ WARNING: The seed data includes test API keys and passwords that are publicly
 visible in this repository. Do NOT use these credentials in production.
 The seed data is intended for local development only.
 
+## Reproducible Test Data
+
+`tools/data_generator.py` supports deterministic generation for test fixtures
+and benchmark inputs:
+
+```bash
+python3 tools/data_generator.py --seed 2026 --format both --output-dir data/test/seed-2026
+python3 tools/data_generator.py --print-seed --output-dir data/test/random-run
+python3 tools/validate_data_generator_determinism.py
+```
+
+The generator writes `metadata.json` with the seed, base timestamp, output
+format, and requested record counts. Reusing the same seed and arguments
+produces byte-for-byte identical output.
+
 ## Migration Files
 
 Migration files follow the naming convention: `{YYYYMMDDHHMMSS}_{description}.sql`
