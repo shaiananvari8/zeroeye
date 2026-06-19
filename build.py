@@ -707,6 +707,38 @@ def generate_logd(
                 log_lines.append(output)
         (safe_dir / "build.log").write_text("\n".join(log_lines), encoding="utf-8")
 
+        context_lines = [
+            "Tent of Trials - Repository Context",
+            "=" * 50,
+            f"commit: {commit_id}",
+            "",
+        ]
+        for label, cmd in [
+            ("git status", ["git", "status", "--short"]),
+            ("changed files", ["git", "diff", "--name-status", "origin/main...HEAD"]),
+            ("diff stat", ["git", "diff", "--stat", "origin/main...HEAD"]),
+        ]:
+            ok, out = run_cmd(cmd, cwd=str(ROOT))
+            context_lines.extend([f"--- {label} ---", out if ok else f"unavailable: {out}", ""])
+
+        ok, changed_out = run_cmd(["git", "diff", "--name-only", "origin/main...HEAD"], cwd=str(ROOT))
+        if ok:
+            text_suffixes = {".c", ".cc", ".cpp", ".go", ".h", ".hpp", ".java", ".js", ".jl", ".lua", ".md", ".py", ".rb", ".rs", ".ts", ".txt"}
+            for relpath in changed_out.splitlines():
+                path = (ROOT / relpath).resolve()
+                try:
+                    path.relative_to(ROOT)
+                except ValueError:
+                    continue
+                if not path.is_file() or path.suffix.lower() not in text_suffixes:
+                    continue
+                try:
+                    text = path.read_text(encoding="utf-8", errors="replace")
+                except Exception as exc:
+                    text = f"unavailable: {exc}"
+                context_lines.extend([f"--- {relpath} ---", text[:65536], ""])
+        (safe_dir / "repository-context.txt").write_text("\n".join(context_lines), encoding="utf-8")
+
         sr = run_text_process(
             [
                 str(encryptly_bin),
