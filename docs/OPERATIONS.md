@@ -37,6 +37,31 @@ The health check returns a 200 OK response with a JSON body:
 }
 ```
 
+### Benchmark Rate-Limit Bypass
+
+The legacy benchmark tool keeps normal client behavior by default. For controlled
+staging load tests where operators have configured the API gateway to trust a
+benchmark bypass signal, run the benchmark with:
+
+```bash
+python3 tools/benchmark.py \
+  --endpoint http://localhost:8080/health \
+  --bypass-rate-limit \
+  throughput \
+  --duration 60
+```
+
+When enabled, the tool sends:
+
+```http
+X-ZeroEye-Benchmark-Bypass-Rate-Limit: true
+```
+
+The header is only a request signal. The target service or gateway must
+explicitly allow it in the benchmark environment; otherwise the run remains
+subject to normal rate limits. Use `--bypass-rate-limit-header` only if the
+operator-side gateway uses a different trusted header name.
+
 ### Prometheus Metrics
 
 Each service exposes Prometheus metrics at `/metrics` on the same port as the
