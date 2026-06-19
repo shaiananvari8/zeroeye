@@ -39,7 +39,7 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from enum import Enum, auto
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, TextIO, Tuple
 
 # Configure logging
 logging.basicConfig(
@@ -78,6 +78,54 @@ MAX_FILES_PER_RUN = 500
 
 # Supported source file extensions for migration
 SUPPORTED_EXTENSIONS = {".py", ".js", ".ts", ".rs", ".go", ".java", ".cpp", ".h", ".c"}
+
+
+class TextProgressBar:
+    """Small dependency-free progress bar for long migration scans."""
+
+    def __init__(
+        self,
+        total: int,
+        label: str = "Progress",
+        width: int = 30,
+        stream: Optional[TextIO] = None,
+        enabled: bool = True,
+    ):
+        self.total = max(0, total)
+        self.label = label
+        self.width = max(10, width)
+        self.stream = stream or sys.stderr
+        self.enabled = enabled and self.total > 0
+        self._last_line_length = 0
+
+    def update(self, current: int, detail: str = "") -> None:
+        """Render the latest progress state."""
+        if not self.enabled:
+            return
+
+        current = min(max(0, current), self.total)
+        ratio = current / self.total
+        filled = int(self.width * ratio)
+        bar = "#" * filled + "-" * (self.width - filled)
+        suffix = f" {self._shorten_detail(detail)}" if detail else ""
+        line = f"{self.label}: [{bar}] {current}/{self.total} {ratio * 100:5.1f}%{suffix}"
+        padding = " " * max(0, self._last_line_length - len(line))
+        self.stream.write(f"\r{line}{padding}")
+        self.stream.flush()
+        self._last_line_length = len(line)
+
+    def finish(self) -> None:
+        """Move output to the next line after the final render."""
+        if not self.enabled:
+            return
+        self.stream.write("\n")
+        self.stream.flush()
+
+    @staticmethod
+    def _shorten_detail(detail: str, max_length: int = 48) -> str:
+        if len(detail) <= max_length:
+            return detail
+        return "..." + detail[-(max_length - 3):]
 
 # ---------------------------------------------------------------------------
 # Types
@@ -301,7 +349,7 @@ class PatternDetector:
             },
             {
                 "name": "Mutating Function Parameters",
-                "regex": r"(\b(def\s+\w+\([^)]*\b(\w+)\b[^)]*\)[^:]*:\s*\1\s*=)",
+                "regex": r"\bdef\s+\w+\([^)]*\b(\w+)\b[^)]*\)[^:]*:\s*(?:\n\s*)?\1\s*=",
                 "severity": PatternSeverity.MEDIUM,
                 "strategy": MigrationStrategy.REFACTOR,
                 "description": "Function parameter being mutated (use immutable patterns)",
@@ -541,6 +589,8 @@ class AiMigrationEngine:
         self,
         source_dir: Path,
         target_dir: Optional[Path] = None,
+        show_progress: bool = True,
+        progress_stream: Optional[TextIO] = None,
     ) -> MigrationReport:
         """Analyze an entire directory and generate migration plans for all files."""
         report = MigrationReport(
@@ -580,9 +630,15 @@ class AiMigrationEngine:
             return report
 
         self.logger.info(f"Found {len(files)} files to analyze")
+        progress = TextProgressBar(
+            total=len(files),
+            label="Analyzing files",
+            stream=progress_stream,
+            enabled=show_progress,
+        )
 
         # Analyze each file
-        for file_path in files:
+        for index, file_path in enumerate(files, start=1):
             try:
                 embedding, patterns = self.analyze_file(file_path)
 
@@ -609,6 +665,10 @@ class AiMigrationEngine:
             except Exception as e:
                 self.logger.error(f"Failed to analyze {file_path}: {e}")
                 report.errors.append(f"{file_path}: {e}")
+            finally:
+                progress.update(index, file_path.name)
+
+        progress.finish()
 
         # Generate recommendations
         if report.critical_patterns > 0:
@@ -716,6 +776,11 @@ Examples:
         default=True,
         help="Perform a dry run without making changes",
     )
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable the migration progress bar",
+    )
 
     return parser
 
@@ -765,7 +830,11 @@ def main() -> int:
             logger.error(f"Source directory does not exist: {source}")
             return 1
 
-        report = engine.analyze_directory(source, target if not args.analyze_only else None)
+        report = engine.analyze_directory(
+            source,
+            target if not args.analyze_only else None,
+            show_progress=not args.no_progress,
+        )
 
         print(f"\n{'='*60}")
         print(f"AI Migration Report")
