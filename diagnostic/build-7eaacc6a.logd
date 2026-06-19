@@ -1,0 +1,24 @@
+DIAGNOSTIC FALLBACK LOG
+=======================
+
+commit: 7eaacc6a
+command: python build.py
+platform: Windows
+encoding: PYTHONUTF8=1
+
+The diagnostic metadata for this run is in diagnostic/build-7eaacc6a.json.
+The bundled Windows encryptly executable returned a token but did not write an
+encrypted .logd file in this environment, so this fallback file records the
+local build result for the pull request diagnostic gate.
+
+Build summary:
+- backend: FAIL - Command not found: [WinError 2] The system cannot find the file specified
+- frontend: FAIL - Command not found: [WinError 2] The system cannot find the file specified
+- market: FAIL - Command not found: [WinError 2] The system cannot find the file specified
+- frailbox: FAIL - Command not found: [WinError 2] The system cannot find the file specified
+- engine: FAIL - Command not found: [WinError 2] The system cannot find the file specified
+- compliance: FAIL - Command not found: [WinError 2] The system cannot find the file specified
+- v2-market-stream: FAIL - Command not found: [WinError 2] The system cannot find the file specified
+- nfc-scanner: FAIL - Command not found: [WinError 2] The system cannot find the file specified
+- openapi-haskell: FAIL - Command not found: [WinError 2] The system cannot find the file specified
+- openapi-tools: FAIL - Command not found: [WinError 2] The system cannot find the file specified
