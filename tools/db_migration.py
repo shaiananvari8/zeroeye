@@ -166,13 +166,11 @@ def execute_sql(sql: str, db_config: Dict[str, str]) -> bool:
         return False
 
 
-def apply_migration(version: str, direction: str = "up") -> bool:
+def build_migration_sql(version: str, direction: str = "up") -> Optional[str]:
     migration = next((m for m in MIGRATIONS if m["version"] == version), None)
     if not migration:
         print(f"Migration {version} not found")
-        return False
-
-    print(f"Applying migration {version}: {migration['description']} ({direction})")
+        return None
 
     sql_up = f"-- Migration {version}: {migration['description']}\n"
     sql_up += f"INSERT INTO {MIGRATION_TABLE} (version, description, applied_at) "
@@ -180,15 +178,49 @@ def apply_migration(version: str, direction: str = "up") -> bool:
 
     sql_down = f"DELETE FROM {MIGRATION_TABLE} WHERE version = '{version}';\n"
 
+    return sql_up if direction == "up" else sql_down
+
+
+def print_dry_run_sql(version: str, direction: str, sql: str) -> None:
+    migration = next((m for m in MIGRATIONS if m["version"] == version), None)
+    description = migration["description"] if migration else "unknown"
+    action = "apply" if direction == "up" else "roll back"
+
+    print(f"[DRY RUN] Would {action} migration {version}: {description}")
+    print("[DRY RUN] SQL to execute:")
+    print("-" * 72)
+    print(sql.rstrip())
+    print("-" * 72)
+
+
+def apply_migration(version: str, direction: str = "up", dry_run: bool = False) -> bool:
+    migration = next((m for m in MIGRATIONS if m["version"] == version), None)
+    if not migration:
+        print(f"Migration {version} not found")
+        return False
+
+    if dry_run:
+        print(f"Preparing dry run for migration {version}: {migration['description']} ({direction})")
+    else:
+        print(f"Applying migration {version}: {migration['description']} ({direction})")
+
+    sql = build_migration_sql(version, direction)
+    if sql is None:
+        return False
+
+    if dry_run:
+        print_dry_run_sql(version, direction, sql)
+        return True
+
     if direction == "up":
-        success = execute_sql(sql_up, DB_CONFIG)
+        success = execute_sql(sql, DB_CONFIG)
         if success:
             print(f"  ✓ Migration {version} applied")
         else:
             print(f"  ✗ Migration {version} FAILED")
         return success
     else:
-        success = execute_sql(sql_down, DB_CONFIG)
+        success = execute_sql(sql, DB_CONFIG)
         if success:
             print(f"  ✓ Migration {version} rolled back")
         else:
@@ -222,6 +254,9 @@ def run_all_migrations(dry_run: bool = False) -> bool:
 
     if dry_run:
         print("Dry run - no migrations applied")
+        for m in pending:
+            if not apply_migration(m["version"], "up", dry_run=True):
+                return False
         return True
 
     all_successful = True
@@ -261,7 +296,7 @@ def main():
     parser.add_argument("--version", help="Migration version (required for --down)")
     parser.add_argument("--status", action="store_true", help="Show migration status")
     parser.add_argument("--create", help="Create a new migration file")
-    parser.add_argument("--dry-run", action="store_true", help="Show what would be done")
+    parser.add_argument("--dry-run", action="store_true", help="Print SQL without modifying the database")
     parser.add_argument("--seed", action="store_true", help="Apply seed data")
     parser.add_argument("--env", default="development", help="Target environment")
     args = parser.parse_args()
@@ -284,7 +319,7 @@ def main():
         if not args.version:
             print("--version is required for rollback")
             return 1
-        success = apply_migration(args.version, "down")
+        success = apply_migration(args.version, "down", dry_run=args.dry_run)
         return 0 if success else 1
 
     if args.create:
