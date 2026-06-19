@@ -103,6 +103,19 @@ DEFAULT_MAX_LINE_LENGTH = 100
 DEFAULT_MAX_FILE_LENGTH = 500
 DEFAULT_MAX_PARAMS = 5
 
+
+def normalize_ignore_extensions(raw: str) -> Set[str]:
+    """Normalize a comma-separated extension list to lowercase dotted suffixes."""
+    ignored: Set[str] = set()
+    for item in raw.split(","):
+        ext = item.strip().lower()
+        if not ext:
+            continue
+        if not ext.startswith("."):
+            ext = f".{ext}"
+        ignored.add(ext)
+    return ignored
+
 # ---------------------------------------------------------------------------
 # Types
 # ---------------------------------------------------------------------------
@@ -398,7 +411,7 @@ class SecurityAuditor:
             {
                 "id": "SEC-PATH-TRAVERSAL",
                 "name": "Path Traversal",
-                "severity": ReviewSeverity.HIGH,
+                "severity": ReviewSeverity.ERROR,
                 "pattern": r"(open|read|write|unlink|rmdir|Path::new)\s*\(\s*['\"](\.\./|/etc/|/var/)",
                 "message": "Possible path traversal vulnerability. Validate file paths.",
                 "effort": 20,
@@ -406,7 +419,7 @@ class SecurityAuditor:
             {
                 "id": "SEC-INSECURE-RANDOM",
                 "name": "Insecure Random Number Generator",
-                "severity": ReviewSeverity.HIGH,
+                "severity": ReviewSeverity.ERROR,
                 "pattern": r"(random\.randint|random\.choice|srand|rand\(\)|math\.random)",
                 "message": "Use cryptographically secure random generation for security-sensitive contexts.",
                 "effort": 10,
@@ -414,7 +427,7 @@ class SecurityAuditor:
             {
                 "id": "SEC-INSECURE-COOKIE",
                 "name": "Insecure Cookie Configuration",
-                "severity": ReviewSeverity.HIGH,
+                "severity": ReviewSeverity.ERROR,
                 "pattern": r"cookie\s*[\[=]\s*.*\b(httpOnly|secure|sameSite)\b\s*[=:]\s*(false|False|None)",
                 "message": "Insecure cookie configuration. Set HttpOnly, Secure, and SameSite attributes.",
                 "effort": 10,
@@ -422,7 +435,7 @@ class SecurityAuditor:
             {
                 "id": "SEC-XXE",
                 "name": "XML External Entity (XXE)",
-                "severity": ReviewSeverity.HIGH,
+                "severity": ReviewSeverity.ERROR,
                 "pattern": r"(xml\.etree|xml_parser|parse\(|SAXParser|DocumentBuilder)",
                 "message": "Possible XXE vulnerability. Disable external entity parsing.",
                 "effort": 20,
@@ -701,8 +714,14 @@ class AiCodeReviewer:
         self.logger.info(result.summary)
         return result
 
-    def review_directory(self, path: Path, recursive: bool = True) -> ProjectReviewReport:
+    def review_directory(
+        self,
+        path: Path,
+        recursive: bool = True,
+        ignore_extensions: Optional[Set[str]] = None,
+    ) -> ProjectReviewReport:
         """Review all supported files in a directory."""
+        ignored = {ext.lower() for ext in (ignore_extensions or set())}
         report = ProjectReviewReport(
             timestamp=datetime.now().isoformat(),
             project_path=str(path),
@@ -717,10 +736,11 @@ class AiCodeReviewer:
         )
 
         # Collect files
+        review_extensions = REVIEW_EXTENSIONS - ignored
         if recursive:
-            files = [f for ext in REVIEW_EXTENSIONS for f in path.rglob(f"*{ext}")]
+            files = [f for ext in review_extensions for f in path.rglob(f"*{ext}")]
         else:
-            files = [f for ext in REVIEW_EXTENSIONS for f in path.glob(f"*{ext}")]
+            files = [f for ext in review_extensions for f in path.glob(f"*{ext}")]
 
         # Exclude common generated/vendor directories
         files = [
@@ -733,6 +753,8 @@ class AiCodeReviewer:
         ]
 
         report.total_files = len(files)
+        if ignored:
+            self.logger.info(f"Ignoring extensions: {', '.join(sorted(ignored))}")
         self.logger.info(f"Found {len(files)} files to review")
 
         for file_path in files:
@@ -795,6 +817,11 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--path", type=str, required=True, help="File or directory to review")
     parser.add_argument("--recursive", action="store_true", help="Review directories recursively")
     parser.add_argument("--output", type=str, default=None, help="Output JSON report path")
+    parser.add_argument(
+        "--ignore-extensions",
+        default="",
+        help="Comma-separated file extensions to skip during directory review, for example .md,.txt",
+    )
     return parser
 
 
@@ -804,8 +831,12 @@ def main() -> int:
 
     reviewer = AiCodeReviewer()
     path = Path(args.path)
+    ignore_extensions = normalize_ignore_extensions(args.ignore_extensions)
 
     if path.is_file():
+        if path.suffix.lower() in ignore_extensions:
+            logger.info(f"Skipping {path}; extension is ignored")
+            return 0
         result = reviewer.review_file(path)
         print(f"\n{'='*60}")
         print(f"AI Code Review: {path}")
@@ -836,7 +867,7 @@ def main() -> int:
         print()
 
     elif path.is_dir():
-        report = reviewer.review_directory(path, args.recursive)
+        report = reviewer.review_directory(path, args.recursive, ignore_extensions=ignore_extensions)
         print(f"\n{'='*60}")
         print(f"AI Project Review: {path}")
         print(f"{'='*60}")
