@@ -276,25 +276,82 @@ export async function logout(): Promise<void> {
   notifyListeners(null);
 }
 
+const REFRESH_MARKER_KEY = 'tot_refresh_in_progress';
+let refreshPromise: Promise<AuthTokens | null> | null = null;
+
 export async function refreshTokens(): Promise<AuthTokens | null> {
-  const tokens = currentTokens || loadStoredTokens();
-  if (!tokens?.refreshToken) return null;
+  // If already refreshing in this tab, return the same promise
+  if (refreshPromise) return refreshPromise;
 
-  try {
-    const response = await post<{ tokens: AuthTokens }>('/auth/refresh', {
-      refreshToken: tokens.refreshToken,
-    });
+  const doRefresh = async (): Promise<AuthTokens | null> => {
+    // Cross-tab lock check via localStorage
+    try {
+      const inProgress = localStorage.getItem(REFRESH_MARKER_KEY);
+      if (inProgress) {
+        const timestamp = parseInt(inProgress, 10);
+        // If marker is less than 10 seconds old, assume another tab is refreshing
+        if (Date.now() - timestamp < 10000) {
+          // Wait for the other tab to finish and update localStorage
+          return new Promise((resolve) => {
+            const listener = (event: StorageEvent) => {
+              if (event.key === TOKEN_KEY) {
+                window.removeEventListener('storage', listener);
+                if (event.newValue) {
+                  resolve(JSON.parse(event.newValue));
+                } else {
+                  resolve(null);
+                }
+              } else if (event.key === REFRESH_MARKER_KEY && !event.newValue) {
+                // Marker was cleared but tokens didn't change (e.g. refresh failed)
+                window.removeEventListener('storage', listener);
+                resolve(null);
+              }
+            };
+            window.addEventListener('storage', listener);
+            
+            // Timeout fallback in case the other tab crashes
+            setTimeout(() => {
+              window.removeEventListener('storage', listener);
+              resolve(null);
+            }, 10000);
+          });
+        }
+      }
+      localStorage.setItem(REFRESH_MARKER_KEY, Date.now().toString());
+    } catch {
+      // localStorage may be unavailable
+    }
 
-    storeTokens(response.data.tokens);
-    scheduleTokenRefresh(response.data.tokens);
+    const tokens = currentTokens || loadStoredTokens();
+    if (!tokens?.refreshToken) {
+      try { localStorage.removeItem(REFRESH_MARKER_KEY); } catch {}
+      refreshPromise = null;
+      return null;
+    }
 
-    return response.data.tokens;
-  } catch {
-    clearStoredTokens();
-    currentUser = null;
-    notifyListeners(null);
-    return null;
-  }
+    try {
+      const response = await post<{ tokens: AuthTokens }>('/auth/refresh', {
+        refreshToken: tokens.refreshToken,
+      });
+
+      storeTokens(response.data.tokens);
+      scheduleTokenRefresh(response.data.tokens);
+
+      return response.data.tokens;
+    } catch {
+      clearStoredTokens();
+      currentUser = null;
+      notifyListeners(null);
+      return null;
+    } finally {
+      // Always clear the cross-tab marker and in-tab promise
+      try { localStorage.removeItem(REFRESH_MARKER_KEY); } catch {}
+      refreshPromise = null;
+    }
+  };
+
+  refreshPromise = doRefresh();
+  return refreshPromise;
 }
 
 export async function getCurrentUser(): Promise<User | null> {
