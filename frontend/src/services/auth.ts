@@ -124,11 +124,20 @@ export interface Session {
 const TOKEN_KEY = 'tot_auth_tokens';
 const USER_KEY = 'tot_user_data';
 const REFRESH_THRESHOLD = 60; // seconds before expiry to attempt refresh
+const BROADCAST_CHANNEL_NAME = 'tot_auth_refresh';
 
 let currentTokens: AuthTokens | null = null;
 let currentUser: User | null = null;
 let refreshTimer: number | null = null;
 let authListeners: Array<(user: User | null) => void> = [];
+let inFlightRefresh: Promise<AuthTokens | null> | null = null;
+
+let broadcastChannel: BroadcastChannel | null = null;
+try {
+  broadcastChannel = new BroadcastChannel(BROADCAST_CHANNEL_NAME);
+} catch {
+  // BroadcastChannel not supported
+}
 
 // ---------------------------------------------------------------------------
 // HELPERS
@@ -276,25 +285,60 @@ export async function logout(): Promise<void> {
   notifyListeners(null);
 }
 
+function notifyRefreshResult(success: boolean): void {
+  if (broadcastChannel) {
+    try {
+      broadcastChannel.postMessage({ type: 'refresh-complete', success });
+    } catch {
+      // ignore
+    }
+  }
+}
+
+function setupCrossTabListener(): void {
+  if (!broadcastChannel) return;
+  broadcastChannel.onmessage = (event) => {
+    if (event.data?.type === 'refresh-complete' && event.data.success) {
+      // Another tab refreshed successfully, reload tokens
+      loadStoredTokens();
+    }
+  };
+}
+
+setupCrossTabListener();
+
 export async function refreshTokens(): Promise<AuthTokens | null> {
+  // Single-flight: if a refresh is already in progress, return the same promise
+  if (inFlightRefresh) {
+    return inFlightRefresh;
+  }
+
   const tokens = currentTokens || loadStoredTokens();
   if (!tokens?.refreshToken) return null;
 
-  try {
-    const response = await post<{ tokens: AuthTokens }>('/auth/refresh', {
-      refreshToken: tokens.refreshToken,
-    });
+  inFlightRefresh = (async (): Promise<AuthTokens | null> => {
+    try {
+      const response = await post<{ tokens: AuthTokens }>('/auth/refresh', {
+        refreshToken: tokens.refreshToken,
+      });
 
-    storeTokens(response.data.tokens);
-    scheduleTokenRefresh(response.data.tokens);
+      storeTokens(response.data.tokens);
+      scheduleTokenRefresh(response.data.tokens);
+      notifyRefreshResult(true);
 
-    return response.data.tokens;
-  } catch {
-    clearStoredTokens();
-    currentUser = null;
-    notifyListeners(null);
-    return null;
-  }
+      return response.data.tokens;
+    } catch {
+      clearStoredTokens();
+      currentUser = null;
+      notifyListeners(null);
+      notifyRefreshResult(false);
+      return null;
+    } finally {
+      inFlightRefresh = null;
+    }
+  })();
+
+  return inFlightRefresh;
 }
 
 export async function getCurrentUser(): Promise<User | null> {
