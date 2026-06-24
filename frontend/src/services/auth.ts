@@ -130,6 +130,14 @@ let currentUser: User | null = null;
 let refreshTimer: number | null = null;
 let authListeners: Array<(user: User | null) => void> = [];
 
+// Single-flight token refresh: concurrent callers share one in-flight operation.
+let refreshInFlight: Promise<AuthTokens | null> | null = null;
+
+// Cross-tab refresh notification (BroadcastChannel with storage-event fallback).
+const REFRESH_CHANNEL_NAME = 'tot_auth_refresh';
+let refreshChannel: BroadcastChannel | null = null;
+let crossTabSyncInitialized = false;
+
 // ---------------------------------------------------------------------------
 // HELPERS
 // ---------------------------------------------------------------------------
@@ -172,6 +180,7 @@ function clearStoredTokens(): void {
 }
 
 function loadStoredTokens(): AuthTokens | null {
+  ensureCrossTabSync();
   try {
     const stored = localStorage.getItem(TOKEN_KEY);
     if (stored) {
@@ -194,6 +203,57 @@ function notifyListeners(user: User | null): void {
     } catch {
       // ignore listener errors
     }
+  }
+}
+
+function getRefreshChannel(): BroadcastChannel | null {
+  if (refreshChannel) return refreshChannel;
+  try {
+    refreshChannel = new BroadcastChannel(REFRESH_CHANNEL_NAME);
+  } catch {
+    refreshChannel = null;
+  }
+  return refreshChannel;
+}
+
+/**
+ * Notify other tabs that a refresh completed. Only a success flag is sent;
+ * raw token values are never placed on the broadcast channel.
+ */
+function broadcastRefreshResult(success: boolean): void {
+  const channel = getRefreshChannel();
+  if (channel) {
+    channel.postMessage({ type: 'refresh-complete', success });
+  }
+}
+
+/**
+ * Listen for refresh completions from other tabs. On success, reload tokens
+ * from storage (never receives the token over the channel). Falls back to the
+ * storage event when BroadcastChannel is unavailable.
+ */
+function ensureCrossTabSync(): void {
+  if (crossTabSyncInitialized) return;
+  crossTabSyncInitialized = true;
+
+  const channel = getRefreshChannel();
+  if (channel) {
+    channel.addEventListener('message', (event: MessageEvent) => {
+      if (event.data?.type === 'refresh-complete' && event.data.success) {
+        loadStoredTokens();
+      }
+    });
+    return;
+  }
+
+  try {
+    window.addEventListener('storage', (event: StorageEvent) => {
+      if (event.key === TOKEN_KEY && event.newValue) {
+        loadStoredTokens();
+      }
+    });
+  } catch {
+    // storage event unavailable
   }
 }
 
@@ -277,23 +337,44 @@ export async function logout(): Promise<void> {
 }
 
 export async function refreshTokens(): Promise<AuthTokens | null> {
-  const tokens = currentTokens || loadStoredTokens();
-  if (!tokens?.refreshToken) return null;
+  // Single-flight: concurrent callers share one in-flight refresh and resolve
+  // from the same final session/token state.
+  if (refreshInFlight) {
+    return refreshInFlight;
+  }
 
+  ensureCrossTabSync();
+
+  const doRefresh = async (): Promise<AuthTokens | null> => {
+    const tokens = currentTokens || loadStoredTokens();
+    if (!tokens?.refreshToken) return null;
+
+    try {
+      const response = await post<{ tokens: AuthTokens }>('/auth/refresh', {
+        refreshToken: tokens.refreshToken,
+      });
+
+      storeTokens(response.data.tokens);
+      scheduleTokenRefresh(response.data.tokens);
+      broadcastRefreshResult(true);
+
+      return response.data.tokens;
+    } catch {
+      clearStoredTokens();
+      currentUser = null;
+      notifyListeners(null);
+      broadcastRefreshResult(false);
+      return null;
+    }
+  };
+
+  refreshInFlight = doRefresh();
   try {
-    const response = await post<{ tokens: AuthTokens }>('/auth/refresh', {
-      refreshToken: tokens.refreshToken,
-    });
-
-    storeTokens(response.data.tokens);
-    scheduleTokenRefresh(response.data.tokens);
-
-    return response.data.tokens;
-  } catch {
-    clearStoredTokens();
-    currentUser = null;
-    notifyListeners(null);
-    return null;
+    return await refreshInFlight;
+  } finally {
+    // Clear the in-flight marker after both success and failure so a later
+    // refresh can retry normally.
+    refreshInFlight = null;
   }
 }
 
