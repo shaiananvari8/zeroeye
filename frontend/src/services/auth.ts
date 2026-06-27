@@ -8,10 +8,6 @@
  * - OAuth2 (Google, GitHub, Microsoft)
  * - SSO (SAML, OpenID Connect)
  * - API key authentication for machine-to-machine
- *
- * TODO: The token refresh logic has a race condition when multiple tabs
- * try to refresh simultaneously. The fix involves a shared worker or
- * broadcast channel coordination.
  */
 
 import { get, post, del } from './api';
@@ -125,10 +121,121 @@ const TOKEN_KEY = 'tot_auth_tokens';
 const USER_KEY = 'tot_user_data';
 const REFRESH_THRESHOLD = 60; // seconds before expiry to attempt refresh
 
+// ---------------------------------------------------------------------------
+// CROSS-TAB COORDINATION (BroadcastChannel)
+// ---------------------------------------------------------------------------
+
+const REFRESH_CHANNEL = 'tot-token-refresh';
+const TOKEN_UPDATE_EVENT = 'token-update';
+
+let broadcastChannel: BroadcastChannel | null = null;
+
+/**
+ * Lazily initialise the BroadcastChannel for cross-tab coordination.
+ * Falls back silently when the API is unavailable (Node.js, older browsers).
+ */
+function getBroadcastChannel(): BroadcastChannel | null {
+  if (broadcastChannel) return broadcastChannel;
+  try {
+    broadcastChannel = new BroadcastChannel(REFRESH_CHANNEL);
+  } catch {
+    return null;
+  }
+  return broadcastChannel;
+}
+
+/**
+ * Listen for token-update messages from other tabs so every tab stays in
+ * sync after one tab refreshes the token.
+ */
+function listenForTokenUpdates(): void {
+  const channel = getBroadcastChannel();
+  if (!channel) return;
+
+  // Remove any stale listener first to avoid duplicates on re-init
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const handler = (event: MessageEvent): void => {
+    if (event.data?.type === TOKEN_UPDATE_EVENT && event.data?.tokens) {
+      const incoming = event.data.tokens as AuthTokens;
+      // Only accept if the incoming token is newer / non-expired
+      if (!isTokenExpired(incoming.accessToken)) {
+        currentTokens = incoming;
+        try {
+          localStorage.setItem(TOKEN_KEY, JSON.stringify(incoming));
+        } catch {
+          // localStorage unavailable
+        }
+        // Re-schedule refresh based on the new token
+        scheduleTokenRefresh(incoming);
+      }
+    }
+  };
+
+  channel.addEventListener('message', handler);
+}
+
+/**
+ * Broadcast new tokens to other tabs so they don't need to refresh too.
+ */
+function broadcastTokenUpdate(tokens: AuthTokens): void {
+  const channel = getBroadcastChannel();
+  if (!channel) return;
+  channel.postMessage({ type: TOKEN_UPDATE_EVENT, tokens });
+}
+
+// ---------------------------------------------------------------------------
+// SINGLE-FLIGHT TOKEN REFRESH
+// ---------------------------------------------------------------------------
+
+/** In-flight refresh promise shared across concurrent calls. */
+let refreshPromise: Promise<AuthTokens | null> | null = null;
+
+/**
+ * Single-flight token refresh — when multiple callers (same tab or
+ * multi-tab via BroadcastChannel) trigger a refresh concurrently, only
+ * one HTTP request is in-flight and all callers share its result.
+ */
+async function singleFlightRefresh(): Promise<AuthTokens | null> {
+  // Return the in-flight promise if one already exists
+  if (refreshPromise) return refreshPromise;
+
+  refreshPromise = (async (): Promise<AuthTokens | null> => {
+    try {
+      const tokens = currentTokens || loadStoredTokens();
+      if (!tokens?.refreshToken) return null;
+
+      const response = await post<{ tokens: AuthTokens }>('/auth/refresh', {
+        refreshToken: tokens.refreshToken,
+      });
+
+      const newTokens = response.data.tokens;
+      storeTokens(newTokens);
+      scheduleTokenRefresh(newTokens);
+
+      // Tell sibling tabs about the new tokens
+      broadcastTokenUpdate(newTokens);
+
+      return newTokens;
+    } catch {
+      clearStoredTokens();
+      currentUser = null;
+      notifyListeners(null);
+      return null;
+    } finally {
+      refreshPromise = null;
+    }
+  })();
+
+  return refreshPromise;
+}
+
 let currentTokens: AuthTokens | null = null;
 let currentUser: User | null = null;
 let refreshTimer: number | null = null;
 let authListeners: Array<(user: User | null) => void> = [];
+
+// Start listening for cross-tab token broadcasts immediately
+listenForTokenUpdates();
 
 // ---------------------------------------------------------------------------
 // HELPERS
@@ -277,24 +384,7 @@ export async function logout(): Promise<void> {
 }
 
 export async function refreshTokens(): Promise<AuthTokens | null> {
-  const tokens = currentTokens || loadStoredTokens();
-  if (!tokens?.refreshToken) return null;
-
-  try {
-    const response = await post<{ tokens: AuthTokens }>('/auth/refresh', {
-      refreshToken: tokens.refreshToken,
-    });
-
-    storeTokens(response.data.tokens);
-    scheduleTokenRefresh(response.data.tokens);
-
-    return response.data.tokens;
-  } catch {
-    clearStoredTokens();
-    currentUser = null;
-    notifyListeners(null);
-    return null;
-  }
+  return singleFlightRefresh();
 }
 
 export async function getCurrentUser(): Promise<User | null> {
