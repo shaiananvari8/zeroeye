@@ -7,6 +7,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/tent-of-trials/market/ai"
 	"github.com/tent-of-trials/market/matching"
 	"github.com/tent-of-trials/market/orderbook"
 	"github.com/tent-of-trials/market/types"
@@ -61,6 +62,18 @@ func main() {
 	logger.Info("matching engine initialized",
 		zap.Int("symbols", len(parsedSymbols)),
 	)
+
+	readToolHook := ai.NewReadToolHook()
+	readTool := ai.NewMarketReadTool(nil, nil, nil, nil)
+	for sym, book := range books {
+		readTool.RegisterOrderBook(sym, book)
+	}
+	readToolHook.Register(readTool)
+	logger.Info("read tool hook initialized",
+		zap.Int("books", len(books)),
+		zap.Int("providers", readToolHook.Count()),
+	)
+	fmt.Printf("market: read tool hook registered with %d provider(s)\n", readToolHook.Count())
 
 	hub := ws.NewHub(logger)
 	go hub.Run()
