@@ -280,20 +280,62 @@ export async function refreshTokens(): Promise<AuthTokens | null> {
   const tokens = currentTokens || loadStoredTokens();
   if (!tokens?.refreshToken) return null;
 
+  // Single-flight: concurrent callers (incl. multiple tabs) share ONE in-flight
+  // refresh instead of each firing their own /auth/refresh. Resolves the race
+  // described in issue #1 — overlapping refreshes no longer write stale tokens
+  // or clobber each other's session state.
+  if (inFlightRefresh) return inFlightRefresh;
+
+  inFlightRefresh = (async () => {
+    try {
+      const response = await post<{ tokens: AuthTokens }>('/auth/refresh', {
+        refreshToken: tokens.refreshToken,
+      });
+
+      storeTokens(response.data.tokens);
+      scheduleTokenRefresh(response.data.tokens);
+
+      // Notify other tabs that a fresh token is available so they don't
+      // immediately kick off their own refresh.
+      notifyTokenRefreshed(response.data.tokens);
+
+      return response.data.tokens;
+    } catch {
+      clearStoredTokens();
+      currentUser = null;
+      notifyListeners(null);
+      return null;
+    } finally {
+      // Always clear the in-flight handle so a later refresh can run.
+      inFlightRefresh = null;
+    }
+  })();
+
+  return inFlightRefresh;
+}
+
+// Single-flight coordination for token refresh (issue #1).
+let inFlightRefresh: Promise<AuthTokens | null> | null = null;
+
+// Cross-tab notification so only one tab performs the network refresh.
+const refreshChannel: BroadcastChannel | null =
+  typeof BroadcastChannel !== 'undefined' ? new BroadcastChannel('zeroeye-auth-refresh') : null;
+
+if (refreshChannel) {
+  refreshChannel.onmessage = (event: MessageEvent) => {
+    if (event.data?.type === 'token-refreshed' && event.data?.tokens) {
+      // Another tab already refreshed — adopt its tokens, skip our own refresh.
+      storeTokens(event.data.tokens as AuthTokens);
+      scheduleTokenRefresh(event.data.tokens as AuthTokens);
+    }
+  };
+}
+
+function notifyTokenRefreshed(tokens: AuthTokens): void {
   try {
-    const response = await post<{ tokens: AuthTokens }>('/auth/refresh', {
-      refreshToken: tokens.refreshToken,
-    });
-
-    storeTokens(response.data.tokens);
-    scheduleTokenRefresh(response.data.tokens);
-
-    return response.data.tokens;
+    refreshChannel?.postMessage({ type: 'token-refreshed', tokens });
   } catch {
-    clearStoredTokens();
-    currentUser = null;
-    notifyListeners(null);
-    return null;
+    // Broadcast may be unavailable in some environments
   }
 }
 
