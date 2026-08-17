@@ -124,11 +124,31 @@ export interface Session {
 const TOKEN_KEY = 'tot_auth_tokens';
 const USER_KEY = 'tot_user_data';
 const REFRESH_THRESHOLD = 60; // seconds before expiry to attempt refresh
+const REFRESH_LOCK_KEY = 'tot_refresh_inflight';
 
 let currentTokens: AuthTokens | null = null;
 let currentUser: User | null = null;
 let refreshTimer: number | null = null;
 let authListeners: Array<(user: User | null) => void> = [];
+let refreshPromise: Promise<AuthTokens | null> | null = null;
+
+try {
+  if (typeof BroadcastChannel !== 'undefined') {
+    const channel = new BroadcastChannel('tot_auth_channel');
+    channel.onmessage = (event) => {
+      if (event.data?.type === 'REFRESH_SUCCESS') {
+        const tokens = loadStoredTokens();
+        if (tokens) {
+          scheduleTokenRefresh(tokens);
+        }
+      } else if (event.data?.type === 'REFRESH_FAILURE') {
+        clearStoredTokens();
+        currentUser = null;
+        notifyListeners(null);
+      }
+    };
+  }
+} catch (e) {}
 
 // ---------------------------------------------------------------------------
 // HELPERS
@@ -280,21 +300,90 @@ export async function refreshTokens(): Promise<AuthTokens | null> {
   const tokens = currentTokens || loadStoredTokens();
   if (!tokens?.refreshToken) return null;
 
+  if (refreshPromise) return refreshPromise;
+
   try {
-    const response = await post<{ tokens: AuthTokens }>('/auth/refresh', {
-      refreshToken: tokens.refreshToken,
-    });
+    const lockTime = localStorage.getItem(REFRESH_LOCK_KEY);
+    if (lockTime && Date.now() - parseInt(lockTime, 10) < 10000) {
+      refreshPromise = new Promise((resolve) => {
+        let resolved = false;
+        let channel: BroadcastChannel | null = null;
+        
+        const cleanup = () => {
+          if (channel) channel.close();
+          refreshPromise = null;
+        };
 
-    storeTokens(response.data.tokens);
-    scheduleTokenRefresh(response.data.tokens);
+        try {
+          channel = new BroadcastChannel('tot_auth_channel');
+          channel.onmessage = (event) => {
+            if (event.data?.type === 'REFRESH_SUCCESS' || event.data?.type === 'REFRESH_FAILURE') {
+              if (!resolved) {
+                resolved = true;
+                resolve(loadStoredTokens());
+                cleanup();
+              }
+            }
+          };
+        } catch (e) {}
 
-    return response.data.tokens;
-  } catch {
-    clearStoredTokens();
-    currentUser = null;
-    notifyListeners(null);
-    return null;
-  }
+        setTimeout(() => {
+          if (!resolved) {
+            resolved = true;
+            resolve(loadStoredTokens());
+            cleanup();
+          }
+        }, 10000);
+      });
+      return refreshPromise;
+    }
+  } catch (e) {}
+
+  try {
+    localStorage.setItem(REFRESH_LOCK_KEY, Date.now().toString());
+  } catch (e) {}
+
+  refreshPromise = (async () => {
+    try {
+      const response = await post<{ tokens: AuthTokens }>('/auth/refresh', {
+        refreshToken: tokens.refreshToken,
+      });
+
+      storeTokens(response.data.tokens);
+      scheduleTokenRefresh(response.data.tokens);
+
+      try {
+        if (typeof BroadcastChannel !== 'undefined') {
+          const channel = new BroadcastChannel('tot_auth_channel');
+          channel.postMessage({ type: 'REFRESH_SUCCESS' });
+          channel.close();
+        }
+      } catch (e) {}
+
+      return response.data.tokens;
+    } catch {
+      clearStoredTokens();
+      currentUser = null;
+      notifyListeners(null);
+
+      try {
+        if (typeof BroadcastChannel !== 'undefined') {
+          const channel = new BroadcastChannel('tot_auth_channel');
+          channel.postMessage({ type: 'REFRESH_FAILURE' });
+          channel.close();
+        }
+      } catch (e) {}
+
+      return null;
+    } finally {
+      try {
+        localStorage.removeItem(REFRESH_LOCK_KEY);
+      } catch (e) {}
+      refreshPromise = null;
+    }
+  })();
+
+  return refreshPromise;
 }
 
 export async function getCurrentUser(): Promise<User | null> {
