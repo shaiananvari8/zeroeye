@@ -1,0 +1,87 @@
+{
+  "generated_at": "2026-08-17T04:29:44.096570+00:00",
+  "commit": "94e0fb08",
+  "diagnostic_logd": "diagnostic/build-94e0fb08.logd",
+  "diagnostic_logd_error": null,
+  "message_blocker": null,
+  "chunked": false,
+  "chunk_size_bytes": null,
+  "password": "501215605d3130d2ac43",
+  "decrypt_command": "encryptly unpack diagnostic/build-94e0fb08.logd <outdir> --password 501215605d3130d2ac43",
+  "total_modules": 10,
+  "passed": 5,
+  "failed": 5,
+  "modules": [
+    {
+      "name": "backend",
+      "status": "FAIL",
+      "elapsed_seconds": 0,
+      "artifact": null,
+      "output": "Command not found: [Errno 2] No such file or directory: 'cargo'"
+    },
+    {
+      "name": "frontend",
+      "status": "PASS",
+      "elapsed_seconds": 22.237,
+      "artifact": "/root/DELIVERABLES/github_4697583816/zeroeye/frontend/dist",
+      "output": "> tent-frontend@0.0.0 build\n> tsc -b && vite build\n\nvite v6.4.3 building for production...\ntransforming...\n\u2713 100 modules transformed.\nrendering chunks...\ncomputing gzip size...\ndist/index.html                   0.62 kB \u2502 gzip:  0.34 kB\ndist/assets/state-BkjSKDbY.js     8.91 kB \u2502 gzip:  3.54 kB \u2502 map:    57.15 kB\ndist/assets/vendor-CREcWLHI.js   48.93 kB \u2502 gzip: 17.25 kB \u2502 map:   481.27 kB\ndist/assets/index-CyxcoTyU.js   231.32 kB \u2502 gzip: 72.16 kB \u2502 map: 1,044.42 kB\n\u2713 built in 4.42s"
+    },
+    {
+      "name": "market",
+      "status": "FAIL",
+      "elapsed_seconds": 2.336,
+      "artifact": null,
+      "output": "go: downloading go.uber.org/zap v1.27.0\ngo: downloading github.com/google/uuid v1.6.0\ngo: downloading github.com/shopspring/decimal v1.4.0\ngo: downloading github.com/gorilla/websocket v1.5.3\ngo: downloading go.uber.org/multierr v1.10.0\n# github.com/tent-of-trials/market/matching\nmatching/engine.go:26:20: undefined: atomic.Int64\nnote: module requires Go 1.26\n# go.uber.org/multierr\n/root/go/pkg/mod/go.uber.org/multierr@v1.10.0/error.go:224:20: undefined: atomic.Bool\nnote: module requires Go 1.19"
+    },
+    {
+      "name": "frailbox",
+      "status": "FAIL",
+      "elapsed_seconds": 0.102,
+      "artifact": null,
+      "output": "gcc -Wall -Wextra -Wpedantic -std=c2x -O2 -g -D_FORTIFY_SOURCE=3 -fstack-protector-strong -fPIE -Iinclude -MMD -MP -c src/arena.c -o build/src/arena.o\n<command-line>: warning: \"_FORTIFY_SOURCE\" redefined\n<built-in>: note: this is the location of the previous definition\nsrc/arena.c: In function \u2018region_alloc\u2019:\nsrc/arena.c:13:36: error: \u2018MAP_ANONYMOUS\u2019 undeclared (first use in this function)\n   13 |     int mmap_flags = MAP_PRIVATE | MAP_ANONYMOUS;\n      |                                    ^~~~~~~~~~~~~\nsrc/arena.c:13:36: note: each undeclared identifier is reported only once for each function it appears in\nsrc/arena.c:17:23: error: \u2018MAP_HUGETLB\u2019 undeclared (first use in this function)\n   17 |         mmap_flags |= MAP_HUGETLB;\n      |                       ^~~~~~~~~~~\nsrc/arena.c: In function \u2018arena_contains\u2019:\nsrc/arena.c:179:17: warning: comparison of distinct pointer types lacks a cast\n  179 |             ptr < (char *)region->start + region->size) {\n      |                 ^\nmake: *** [Makefile:27: build/src/arena.o] Error 1"
+    },
+    {
+      "name": "engine",
+      "status": "FAIL",
+      "elapsed_seconds": 0,
+      "artifact": null,
+      "output": "Command not found: [Errno 2] No such file or directory: 'cmake'"
+    },
+    {
+      "name": "compliance",
+      "status": "PASS",
+      "elapsed_seconds": 1.683,
+      "artifact": "/root/DELIVERABLES/github_4697583816/zeroeye/compliance/build",
+      "output": ""
+    },
+    {
+      "name": "v2-market-stream",
+      "status": "PASS",
+      "elapsed_seconds": 0.044,
+      "artifact": null,
+      "output": "Syntax OK"
+    },
+    {
+      "name": "nfc-scanner",
+      "status": "PASS",
+      "elapsed_seconds": 0.011,
+      "artifact": null,
+      "output": ""
+    },
+    {
+      "name": "openapi-haskell",
+      "status": "FAIL",
+      "elapsed_seconds": 0,
+      "artifact": null,
+      "output": "Command not found: [Errno 2] No such file or directory: 'ghc'"
+    },
+    {
+      "name": "openapi-tools",
+      "status": "PASS",
+      "elapsed_seconds": 0.004,
+      "artifact": null,
+      "output": ""
+    }
+  ],
+  "pr_note": "Include the encrypted diagnostic logd artifact(s): diagnostic/build-94e0fb08.logd. The encrypted .logd is the required diagnostic content for PR review; this JSON file is metadata. Maintainers may ask you to remove these diagnostic artifacts before merging."
+}
