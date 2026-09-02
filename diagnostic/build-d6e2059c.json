@@ -1,0 +1,91 @@
+{
+  "generated_at": "2026-09-02T02:41:38.491337+00:00",
+  "commit": "d6e2059c",
+  "diagnostic_logd": [
+    "diagnostic/build-d6e2059c-part001.logd",
+    "diagnostic/build-d6e2059c-part002.logd",
+    "diagnostic/build-d6e2059c-part003.logd"
+  ],
+  "diagnostic_logd_error": null,
+  "message_blocker": null,
+  "chunked": true,
+  "chunk_size_bytes": 41943040,
+  "password": "8067deb2ebc6dced7660",
+  "decrypt_command": "encryptly unpack diagnostic/build-d6e2059c.logd <outdir> --password 8067deb2ebc6dced7660",
+  "total_modules": 10,
+  "passed": 4,
+  "failed": 6,
+  "modules": [
+    {
+      "name": "backend",
+      "status": "FAIL",
+      "elapsed_seconds": 0,
+      "artifact": null,
+      "output": "Command not found: [Errno 2] No such file or directory: 'cargo'"
+    },
+    {
+      "name": "frontend",
+      "status": "PASS",
+      "elapsed_seconds": 2.74,
+      "artifact": "/tmp/bounties/zeroeye/frontend/dist",
+      "output": "> tent-frontend@0.0.0 build\n> tsc -b && vite build\n\nvite v6.4.3 building for production...\ntransforming...\n\u2713 100 modules transformed.\nrendering chunks...\ncomputing gzip size...\ndist/index.html                   0.62 kB \u2502 gzip:  0.34 kB\ndist/assets/state-BkjSKDbY.js     8.91 kB \u2502 gzip:  3.54 kB \u2502 map:    57.15 kB\ndist/assets/vendor-CREcWLHI.js   48.93 kB \u2502 gzip: 17.25 kB \u2502 map:   481.27 kB\ndist/assets/index-CyxcoTyU.js   231.32 kB \u2502 gzip: 72.16 kB \u2502 map: 1,044.42 kB\n\u2713 built in 878ms"
+    },
+    {
+      "name": "market",
+      "status": "FAIL",
+      "elapsed_seconds": 0,
+      "artifact": null,
+      "output": "Command not found: [Errno 2] No such file or directory: 'go'"
+    },
+    {
+      "name": "frailbox",
+      "status": "PASS",
+      "elapsed_seconds": 0.001,
+      "artifact": "/tmp/bounties/zeroeye/frailbox/frailbox",
+      "output": "make: Nada a ser feito para 'all'."
+    },
+    {
+      "name": "engine",
+      "status": "PASS",
+      "elapsed_seconds": 0.072,
+      "artifact": "/tmp/bounties/zeroeye/frailbox/engine/build/trial-engine",
+      "output": "[100%] Built target trial-engine"
+    },
+    {
+      "name": "compliance",
+      "status": "PASS",
+      "elapsed_seconds": 0.448,
+      "artifact": "/tmp/bounties/zeroeye/compliance/build",
+      "output": "Note: ComplianceAuditor.java uses or overrides a deprecated API.\nNote: Recompile with -Xlint:deprecation for details."
+    },
+    {
+      "name": "v2-market-stream",
+      "status": "FAIL",
+      "elapsed_seconds": 0,
+      "artifact": null,
+      "output": "Command not found: [Errno 2] No such file or directory: 'ruby'"
+    },
+    {
+      "name": "nfc-scanner",
+      "status": "FAIL",
+      "elapsed_seconds": 0,
+      "artifact": null,
+      "output": "Command not found: [Errno 2] No such file or directory: 'luac'"
+    },
+    {
+      "name": "openapi-haskell",
+      "status": "FAIL",
+      "elapsed_seconds": 0,
+      "artifact": null,
+      "output": "Command not found: [Errno 2] No such file or directory: 'ghc'"
+    },
+    {
+      "name": "openapi-tools",
+      "status": "FAIL",
+      "elapsed_seconds": 0,
+      "artifact": null,
+      "output": "Command not found: [Errno 2] No such file or directory: 'luac'"
+    }
+  ],
+  "pr_note": "Include the encrypted diagnostic logd artifact(s): diagnostic/build-d6e2059c-part001.logd, diagnostic/build-d6e2059c-part002.logd, diagnostic/build-d6e2059c-part003.logd. The encrypted .logd is the required diagnostic content for PR review; this JSON file is metadata. Maintainers may ask you to remove these diagnostic artifacts before merging."
+}
