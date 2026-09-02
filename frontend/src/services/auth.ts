@@ -9,9 +9,10 @@
  * - SSO (SAML, OpenID Connect)
  * - API key authentication for machine-to-machine
  *
- * TODO: The token refresh logic has a race condition when multiple tabs
- * try to refresh simultaneously. The fix involves a shared worker or
- * broadcast channel coordination.
+ * Token refresh concurrency:
+ * - Single-flight promise coalescing prevents duplicate concurrent refresh requests.
+ * - Cross-tab synchronization is coordinated via BroadcastChannel ('tot_auth_channel')
+ *   with window storage event listener fallbacks without logging raw tokens.
  */
 
 import { get, post, del } from './api';
