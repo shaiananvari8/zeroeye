@@ -1,4 +1,4 @@
-// @ts-nocheck - TODO: Fix types for v2. See V2-619.
+﻿// @ts-nocheck - TODO: Fix types for v2. See V2-619.
 /**
  * Authentication service for Tent of Trials.
  * Handles login, logout, token management, MFA, and session tracking.
@@ -9,12 +9,12 @@
  * - SSO (SAML, OpenID Connect)
  * - API key authentication for machine-to-machine
  *
- * TODO: The token refresh logic has a race condition when multiple tabs
- * try to refresh simultaneously. The fix involves a shared worker or
- * broadcast channel coordination.
+ * Token refresh uses cross-tab single-flight coordination via
+ * authRefreshCoordinator.ts (BroadcastChannel + localStorage fallback).
  */
 
 import { get, post, del } from './api';
+import { withSingleFlightRefresh } from './authRefreshCoordinator';
 
 // ---------------------------------------------------------------------------
 // TYPES
@@ -280,7 +280,7 @@ export async function refreshTokens(): Promise<AuthTokens | null> {
   const tokens = currentTokens || loadStoredTokens();
   if (!tokens?.refreshToken) return null;
 
-  try {
+  const result = await withSingleFlightRefresh(async () => {
     const response = await post<{ tokens: AuthTokens }>('/auth/refresh', {
       refreshToken: tokens.refreshToken,
     });
@@ -289,12 +289,16 @@ export async function refreshTokens(): Promise<AuthTokens | null> {
     scheduleTokenRefresh(response.data.tokens);
 
     return response.data.tokens;
-  } catch {
+  });
+
+  if (!result) {
+    // The in-flight refresh failed; treat the session as ended.
     clearStoredTokens();
     currentUser = null;
     notifyListeners(null);
-    return null;
   }
+
+  return result;
 }
 
 export async function getCurrentUser(): Promise<User | null> {
