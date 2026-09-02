@@ -124,11 +124,107 @@ export interface Session {
 const TOKEN_KEY = 'tot_auth_tokens';
 const USER_KEY = 'tot_user_data';
 const REFRESH_THRESHOLD = 60; // seconds before expiry to attempt refresh
+const AUTH_CHANNEL_NAME = 'tot_auth_channel';
 
 let currentTokens: AuthTokens | null = null;
 let currentUser: User | null = null;
 let refreshTimer: number | null = null;
 let authListeners: Array<(user: User | null) => void> = [];
+let inFlightRefresh: Promise<AuthTokens | null> | null = null;
+
+// Cross-tab synchronization channel
+let authChannel: BroadcastChannel | null = null;
+if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
+  try {
+    authChannel = new BroadcastChannel(AUTH_CHANNEL_NAME);
+    authChannel.onmessage = (event: MessageEvent) => {
+      handleCrossTabAuthEvent(event.data);
+    };
+  } catch {
+    authChannel = null;
+  }
+}
+
+// Storage event listener fallback for cross-tab sync
+if (typeof window !== 'undefined') {
+  window.addEventListener('storage', (event: StorageEvent) => {
+    if (event.key === TOKEN_KEY) {
+      if (!event.newValue) {
+        currentTokens = null;
+        currentUser = null;
+        if (refreshTimer !== null) {
+          clearTimeout(refreshTimer);
+          refreshTimer = null;
+        }
+        notifyListeners(null);
+      } else {
+        try {
+          const parsed = JSON.parse(event.newValue) as AuthTokens;
+          currentTokens = parsed;
+          scheduleTokenRefresh(parsed);
+        } catch {
+          // ignore parsing error
+        }
+      }
+    } else if (event.key === USER_KEY) {
+      if (!event.newValue) {
+        currentUser = null;
+        notifyListeners(null);
+      } else {
+        try {
+          currentUser = JSON.parse(event.newValue) as User;
+          notifyListeners(currentUser);
+        } catch {
+          // ignore parsing error
+        }
+      }
+    }
+  });
+}
+
+function postCrossTabEvent(type: 'REFRESH_SUCCESS' | 'REFRESH_FAILURE' | 'LOGIN' | 'LOGOUT', payload?: unknown): void {
+  try {
+    authChannel?.postMessage({ type, payload });
+  } catch {
+    // ignore cross-tab broadcast errors
+  }
+}
+
+function handleCrossTabAuthEvent(data: { type: string; payload?: unknown }): void {
+  if (!data || !data.type) return;
+
+  switch (data.type) {
+    case 'LOGIN':
+    case 'REFRESH_SUCCESS': {
+      const stored = loadStoredTokens();
+      if (stored) {
+        currentTokens = stored;
+        scheduleTokenRefresh(stored);
+      }
+      try {
+        const storedUser = localStorage.getItem(USER_KEY);
+        if (storedUser) {
+          currentUser = JSON.parse(storedUser);
+          notifyListeners(currentUser);
+        }
+      } catch {
+        // ignore
+      }
+      break;
+    }
+    case 'LOGOUT':
+    case 'REFRESH_FAILURE': {
+      currentTokens = null;
+      currentUser = null;
+      if (refreshTimer !== null) {
+        clearTimeout(refreshTimer);
+        refreshTimer = null;
+      }
+      notifyListeners(null);
+      break;
+    }
+  }
+}
 
 // ---------------------------------------------------------------------------
 // HELPERS
@@ -236,6 +332,7 @@ export async function login(request: LoginRequest): Promise<AuthTokens> {
 
   scheduleTokenRefresh(response.data.tokens);
   notifyListeners(response.data.user);
+  postCrossTabEvent('LOGIN');
 
   return response.data.tokens;
 }
@@ -254,6 +351,7 @@ export async function register(request: RegisterRequest): Promise<AuthTokens> {
 
   scheduleTokenRefresh(response.data.tokens);
   notifyListeners(response.data.user);
+  postCrossTabEvent('LOGIN');
 
   return response.data.tokens;
 }
@@ -274,27 +372,40 @@ export async function logout(): Promise<void> {
   }
 
   notifyListeners(null);
+  postCrossTabEvent('LOGOUT');
 }
 
 export async function refreshTokens(): Promise<AuthTokens | null> {
+  if (inFlightRefresh) {
+    return inFlightRefresh;
+  }
+
   const tokens = currentTokens || loadStoredTokens();
   if (!tokens?.refreshToken) return null;
 
-  try {
-    const response = await post<{ tokens: AuthTokens }>('/auth/refresh', {
-      refreshToken: tokens.refreshToken,
-    });
+  inFlightRefresh = (async () => {
+    try {
+      const response = await post<{ tokens: AuthTokens }>('/auth/refresh', {
+        refreshToken: tokens.refreshToken,
+      });
 
-    storeTokens(response.data.tokens);
-    scheduleTokenRefresh(response.data.tokens);
+      storeTokens(response.data.tokens);
+      scheduleTokenRefresh(response.data.tokens);
+      postCrossTabEvent('REFRESH_SUCCESS');
 
-    return response.data.tokens;
-  } catch {
-    clearStoredTokens();
-    currentUser = null;
-    notifyListeners(null);
-    return null;
-  }
+      return response.data.tokens;
+    } catch {
+      clearStoredTokens();
+      currentUser = null;
+      notifyListeners(null);
+      postCrossTabEvent('REFRESH_FAILURE');
+      return null;
+    } finally {
+      inFlightRefresh = null;
+    }
+  })();
+
+  return inFlightRefresh;
 }
 
 export async function getCurrentUser(): Promise<User | null> {
