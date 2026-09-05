@@ -9,12 +9,13 @@
  * - SSO (SAML, OpenID Connect)
  * - API key authentication for machine-to-machine
  *
- * TODO: The token refresh logic has a race condition when multiple tabs
- * try to refresh simultaneously. The fix involves a shared worker or
- * broadcast channel coordination.
+* Token refresh uses a single-flight promise within each tab and a
+* localStorage + BroadcastChannel lock across tabs. Concurrent callers
+* share one in-flight refresh request; failure clears the lock so later
+* retries proceed normally.
  */
 
-import { get, post, del } from './api';
+import { get, post, put, del } from './api';
 
 // ---------------------------------------------------------------------------
 // TYPES
@@ -129,6 +130,94 @@ let currentTokens: AuthTokens | null = null;
 let currentUser: User | null = null;
 let refreshTimer: number | null = null;
 let authListeners: Array<(user: User | null) => void> = [];
+
+// Single-flight token refresh coordination
+const REFRESH_LOCK_KEY = 'tot_auth_refresh_lock';
+const REFRESH_CHANNEL_NAME = 'tot_auth_refresh';
+const REFRESH_LOCK_TTL_MS = 15_000;
+let refreshPromise: Promise<AuthTokens | null> | null = null;
+let refreshChannel: BroadcastChannel | null = null;
+let crossTabRefreshWaiters: Array<(value: AuthTokens | null) => void> = [];
+
+function getRefreshChannel(): BroadcastChannel | null {
+  if (typeof BroadcastChannel === 'undefined') return null;
+  if (!refreshChannel) {
+    refreshChannel = new BroadcastChannel(REFRESH_CHANNEL_NAME);
+    refreshChannel.onmessage = (event) => {
+      const { type } = event.data || {};
+      if (type === 'refresh:done') {
+        const refreshed = loadStoredTokens();
+        if (refreshed) scheduleTokenRefresh(refreshed);
+        crossTabRefreshWaiters.forEach((resolve) => resolve(refreshed));
+        crossTabRefreshWaiters = [];
+      } else if (type === 'refresh:failed') {
+        clearStoredTokens();
+        currentUser = null;
+        notifyListeners(null);
+        crossTabRefreshWaiters.forEach((resolve) => resolve(null));
+        crossTabRefreshWaiters = [];
+      }
+    };
+  }
+  return refreshChannel;
+}
+
+function broadcastRefresh(type: 'refresh:done' | 'refresh:failed'): void {
+  const channel = getRefreshChannel();
+  if (channel) {
+    try {
+      channel.postMessage({ type });
+    } catch {
+      // ignore broadcast failures
+    }
+  }
+}
+
+function readRefreshLock(): number | null {
+  try {
+    const raw = localStorage.getItem(REFRESH_LOCK_KEY);
+    if (!raw) return null;
+    const ts = parseInt(raw, 10);
+    return Number.isNaN(ts) ? null : ts;
+  } catch {
+    return null;
+  }
+}
+
+function acquireRefreshLock(): boolean {
+  const now = Date.now();
+  const existing = readRefreshLock();
+  if (existing && now - existing < REFRESH_LOCK_TTL_MS) {
+    return false;
+  }
+  try {
+    localStorage.setItem(REFRESH_LOCK_KEY, String(now));
+    return true;
+  } catch {
+    return true; // fall through to in-flight promise even if storage fails
+  }
+}
+
+function releaseRefreshLock(): void {
+  try {
+    localStorage.removeItem(REFRESH_LOCK_KEY);
+  } catch {
+    // ignore
+  }
+}
+
+function waitForCrossTabRefresh(timeoutMs = REFRESH_LOCK_TTL_MS): Promise<AuthTokens | null> {
+  return new Promise((resolve) => {
+    crossTabRefreshWaiters.push(resolve);
+    window.setTimeout(() => {
+      const index = crossTabRefreshWaiters.indexOf(resolve);
+      if (index !== -1) {
+        crossTabRefreshWaiters.splice(index, 1);
+        resolve(null);
+      }
+    }, timeoutMs);
+  });
+}
 
 // ---------------------------------------------------------------------------
 // HELPERS
@@ -277,24 +366,52 @@ export async function logout(): Promise<void> {
 }
 
 export async function refreshTokens(): Promise<AuthTokens | null> {
+  // Return an existing in-flight refresh promise so concurrent callers
+  // (within this tab) share exactly one network request and resolve to
+  // the same final token state.
+  if (refreshPromise) return refreshPromise;
+
+  // Try to become the cross-tab leader. If another tab already holds the
+  // refresh lock, wait for it to broadcast the outcome instead of issuing
+  // a duplicate request.
+  const isLeader = acquireRefreshLock();
+  if (!isLeader) {
+    // Subscribe to cross-tab refresh broadcasts so the leader tab can wake us
+    // up once it finishes, instead of issuing a duplicate refresh request.
+    getRefreshChannel();
+    return waitForCrossTabRefresh();
+  }
+
   const tokens = currentTokens || loadStoredTokens();
-  if (!tokens?.refreshToken) return null;
-
-  try {
-    const response = await post<{ tokens: AuthTokens }>('/auth/refresh', {
-      refreshToken: tokens.refreshToken,
-    });
-
-    storeTokens(response.data.tokens);
-    scheduleTokenRefresh(response.data.tokens);
-
-    return response.data.tokens;
-  } catch {
-    clearStoredTokens();
-    currentUser = null;
-    notifyListeners(null);
+  if (!tokens?.refreshToken) {
+    releaseRefreshLock();
     return null;
   }
+
+  refreshPromise = (async () => {
+    try {
+      const response = await post<{ tokens: AuthTokens }>('/auth/refresh', {
+        refreshToken: tokens.refreshToken,
+      });
+
+      storeTokens(response.data.tokens);
+      scheduleTokenRefresh(response.data.tokens);
+      broadcastRefresh('refresh:done');
+
+      return response.data.tokens;
+    } catch {
+      clearStoredTokens();
+      currentUser = null;
+      notifyListeners(null);
+      broadcastRefresh('refresh:failed');
+      return null;
+    } finally {
+      releaseRefreshLock();
+      refreshPromise = null;
+    }
+  })();
+
+  return refreshPromise;
 }
 
 export async function getCurrentUser(): Promise<User | null> {
