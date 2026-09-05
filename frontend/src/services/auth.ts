@@ -131,6 +131,60 @@ let refreshTimer: number | null = null;
 let authListeners: Array<(user: User | null) => void> = [];
 
 // ---------------------------------------------------------------------------
+// SINGLE-FLIGHT REFRESH (prevents concurrent refresh race conditions)
+// ---------------------------------------------------------------------------
+
+/** In-flight refresh promise — concurrent callers await the same operation. */
+let inflightRefresh: Promise<AuthTokens | null> | null = null;
+
+/** BroadcastChannel name for cross-tab refresh coordination. */
+const REFRESH_CHANNEL = 'tot_auth_refresh';
+
+/**
+ * Notify other tabs that a refresh completed (or failed).
+ * Uses BroadcastChannel; silently no-ops if unavailable.
+ */
+function broadcastRefreshResult(success: boolean): void {
+  try {
+    const channel = new BroadcastChannel(REFRESH_CHANNEL);
+    channel.postMessage({ type: success ? 'refresh-success' : 'refresh-failed' });
+    channel.close();
+  } catch {
+    // BroadcastChannel not available (e.g., non-browser context, iframe)
+  }
+}
+
+/** Listen for refresh events from other tabs and react accordingly. */
+function setupCrossTabListener(): void {
+  try {
+    const channel = new BroadcastChannel(REFRESH_CHANNEL);
+    channel.onmessage = (event) => {
+      if (event.data?.type === 'refresh-success') {
+        // Another tab refreshed successfully — reload tokens from storage
+        const reloaded = loadStoredTokens();
+        if (reloaded) {
+          currentTokens = reloaded;
+          scheduleTokenRefresh(reloaded);
+          // Don't clear inflightRefresh here — it was set by another tab
+        }
+      } else if (event.data?.type === 'refresh-failed') {
+        // Another tab's refresh failed — clear local state to stay in sync
+        clearStoredTokens();
+        currentUser = null;
+        notifyListeners(null);
+      }
+    };
+  } catch {
+    // BroadcastChannel not available
+  }
+}
+
+// Initialize cross-tab listener once at module load time.
+if (typeof window !== 'undefined') {
+  setupCrossTabListener();
+}
+
+// ---------------------------------------------------------------------------
 // HELPERS
 // ---------------------------------------------------------------------------
 
@@ -265,6 +319,9 @@ export async function logout(): Promise<void> {
     // Silently ignore logout errors - we clear local state regardless
   }
 
+  // Clear in-flight refresh so any pending refresh doesn't resurrect state
+  inflightRefresh = null;
+
   clearStoredTokens();
   currentUser = null;
 
@@ -280,19 +337,38 @@ export async function refreshTokens(): Promise<AuthTokens | null> {
   const tokens = currentTokens || loadStoredTokens();
   if (!tokens?.refreshToken) return null;
 
+  // --- Single-flight: if a refresh is already in-flight, share the result ---
+  if (inflightRefresh) {
+    return inflightRefresh;
+  }
+
+  // Start the refresh and store the promise so concurrent callers can await it.
+  inflightRefresh = (async () => {
+    try {
+      const response = await post<{ tokens: AuthTokens }>('/auth/refresh', {
+        refreshToken: tokens.refreshToken,
+      });
+
+      storeTokens(response.data.tokens);
+      scheduleTokenRefresh(response.data.tokens);
+      broadcastRefreshResult(true);
+
+      return response.data.tokens;
+    } catch (error) {
+      clearStoredTokens();
+      currentUser = null;
+      notifyListeners(null);
+      broadcastRefreshResult(false);
+      throw error; // Re-throw so callers know it failed
+    } finally {
+      // Always clear the in-flight marker so future calls can retry
+      inflightRefresh = null;
+    }
+  })();
+
   try {
-    const response = await post<{ tokens: AuthTokens }>('/auth/refresh', {
-      refreshToken: tokens.refreshToken,
-    });
-
-    storeTokens(response.data.tokens);
-    scheduleTokenRefresh(response.data.tokens);
-
-    return response.data.tokens;
+    return await inflightRefresh;
   } catch {
-    clearStoredTokens();
-    currentUser = null;
-    notifyListeners(null);
     return null;
   }
 }
