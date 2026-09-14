@@ -130,6 +130,27 @@ let currentUser: User | null = null;
 let refreshTimer: number | null = null;
 let authListeners: Array<(user: User | null) => void> = [];
 
+// Refresh calls are single-flight per tab. The storage event and BroadcastChannel
+// only carry lifecycle metadata; a successful tab reloads the token from the
+// existing TOKEN_KEY rather than putting raw tokens in an event payload.
+const REFRESH_EVENT_KEY = `${TOKEN_KEY}_refresh_event`;
+const REFRESH_CHANNEL_NAME = `${TOKEN_KEY}_refresh`;
+type RefreshEventType = 'success' | 'failure';
+interface RefreshEvent {
+  sourceId: string;
+  type: RefreshEventType;
+  timestamp: number;
+  tokens?: AuthTokens;
+}
+
+let refreshInFlight: Promise<AuthTokens | null> | null = null;
+let refreshSyncReady = false;
+let refreshChannel: BroadcastChannel | null = null;
+const refreshSourceId =
+  typeof crypto !== 'undefined' && 'randomUUID' in crypto
+    ? crypto.randomUUID()
+    : `tab-${Math.random().toString(36).slice(2)}-${Date.now()}`;
+
 // ---------------------------------------------------------------------------
 // HELPERS
 // ---------------------------------------------------------------------------
@@ -194,6 +215,76 @@ function notifyListeners(user: User | null): void {
     } catch {
       // ignore listener errors
     }
+  }
+}
+
+function applyExternalRefresh(event: RefreshEvent): void {
+  // Do not let another tab overwrite a refresh that this tab is already
+  // resolving. Its own request will publish the authoritative result.
+  if (event.sourceId === refreshSourceId || refreshInFlight) return;
+
+  if (event.type === 'success') {
+    const tokens = event.tokens || loadStoredTokens();
+    if (!tokens) return;
+
+    storeTokens(tokens);
+    scheduleTokenRefresh(tokens);
+    return;
+  }
+
+  clearStoredTokens();
+  currentUser = null;
+  notifyListeners(null);
+}
+
+function handleRefreshStorageEvent(event: StorageEvent): void {
+  if (event.key !== REFRESH_EVENT_KEY || !event.newValue) return;
+
+  try {
+    applyExternalRefresh(JSON.parse(event.newValue) as RefreshEvent);
+  } catch {
+    // Ignore malformed cross-tab notifications.
+  }
+}
+
+function ensureRefreshSync(): void {
+  if (refreshSyncReady || typeof window === 'undefined') return;
+  refreshSyncReady = true;
+
+  window.addEventListener('storage', handleRefreshStorageEvent);
+
+  if (typeof BroadcastChannel !== 'undefined') {
+    refreshChannel = new BroadcastChannel(REFRESH_CHANNEL_NAME);
+    refreshChannel.addEventListener('message', event => {
+      applyExternalRefresh(event.data as RefreshEvent);
+    });
+  }
+}
+
+function publishRefreshEvent(type: RefreshEventType, tokens?: AuthTokens): void {
+  const event: RefreshEvent = {
+    sourceId: refreshSourceId,
+    type,
+    timestamp: Date.now(),
+    // BroadcastChannel is same-origin and ephemeral. It is the fallback for
+    // environments where localStorage is unavailable; storage events carry
+    // only metadata and never persist the token in the event record.
+    tokens,
+  };
+
+  try {
+    refreshChannel?.postMessage(event);
+  } catch {
+    // A closed channel must not make an otherwise successful refresh fail.
+  }
+
+  try {
+    localStorage.setItem(
+      REFRESH_EVENT_KEY,
+      JSON.stringify({ sourceId: refreshSourceId, type, timestamp: event.timestamp }),
+    );
+  } catch {
+    // localStorage may be unavailable (for example, in private browsing).
   }
 }
 
@@ -276,25 +367,43 @@ export async function logout(): Promise<void> {
   notifyListeners(null);
 }
 
-export async function refreshTokens(): Promise<AuthTokens | null> {
+export function refreshTokens(): Promise<AuthTokens | null> {
+  ensureRefreshSync();
+  if (refreshInFlight) return refreshInFlight;
+
   const tokens = currentTokens || loadStoredTokens();
-  if (!tokens?.refreshToken) return null;
+  if (!tokens?.refreshToken) return Promise.resolve(null);
 
-  try {
-    const response = await post<{ tokens: AuthTokens }>('/auth/refresh', {
-      refreshToken: tokens.refreshToken,
-    });
+  // Assign the promise before the first await so concurrent callers in this
+  // tab always share the same network request and final state.
+  const operation = (async (): Promise<AuthTokens | null> => {
+    try {
+      const response = await post<{ tokens: AuthTokens }>('/auth/refresh', {
+        refreshToken: tokens.refreshToken,
+      });
 
-    storeTokens(response.data.tokens);
-    scheduleTokenRefresh(response.data.tokens);
+      storeTokens(response.data.tokens);
+      scheduleTokenRefresh(response.data.tokens);
+      publishRefreshEvent('success', response.data.tokens);
 
-    return response.data.tokens;
-  } catch {
-    clearStoredTokens();
-    currentUser = null;
-    notifyListeners(null);
-    return null;
-  }
+      return response.data.tokens;
+    } catch {
+      clearStoredTokens();
+      currentUser = null;
+      notifyListeners(null);
+      publishRefreshEvent('failure');
+      return null;
+    }
+  })();
+
+  refreshInFlight = operation;
+  operation.finally(() => {
+    // Clear only this operation's marker so a later refresh can retry after
+    // either success or failure.
+    if (refreshInFlight === operation) refreshInFlight = null;
+  });
+
+  return operation;
 }
 
 export async function getCurrentUser(): Promise<User | null> {
