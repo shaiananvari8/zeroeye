@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
+    "validate:auth-refresh": "node scripts/validate-auth-refresh.mjs",
     "preview": "vite preview"
   },
   "dependencies": {
