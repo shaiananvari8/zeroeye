@@ -9,12 +9,12 @@
  * - SSO (SAML, OpenID Connect)
  * - API key authentication for machine-to-machine
  *
- * TODO: The token refresh logic has a race condition when multiple tabs
- * try to refresh simultaneously. The fix involves a shared worker or
- * broadcast channel coordination.
+ * Token Refresh Architecture:
+ * - Single-flight coordination deduplicates concurrent refresh calls.
+ * - BroadcastChannel synchronizes token renewal and session revocation across browser tabs.
  */
 
-import { get, post, del } from './api';
+import { get, post, del, put } from './api';
 
 // ---------------------------------------------------------------------------
 // TYPES
@@ -123,12 +123,60 @@ export interface Session {
 
 const TOKEN_KEY = 'tot_auth_tokens';
 const USER_KEY = 'tot_user_data';
+const AUTH_CHANNEL_NAME = 'tot_auth_channel';
 const REFRESH_THRESHOLD = 60; // seconds before expiry to attempt refresh
 
 let currentTokens: AuthTokens | null = null;
 let currentUser: User | null = null;
 let refreshTimer: number | null = null;
 let authListeners: Array<(user: User | null) => void> = [];
+
+// Single-flight in-flight refresh promise
+let inFlightRefreshPromise: Promise<AuthTokens | null> | null = null;
+
+// Cross-tab broadcast channel
+let broadcastChannel: BroadcastChannel | null = null;
+
+// ---------------------------------------------------------------------------
+// CROSS-TAB COORDINATION
+// ---------------------------------------------------------------------------
+
+function initBroadcastChannel(): void {
+  if (typeof window !== 'undefined' && 'BroadcastChannel' in window && !broadcastChannel) {
+    try {
+      broadcastChannel = new BroadcastChannel(AUTH_CHANNEL_NAME);
+      broadcastChannel.onmessage = (event) => {
+        const { type } = event.data || {};
+        if (type === 'REFRESH_SUCCESS') {
+          const tokens = loadStoredTokens();
+          if (tokens) {
+            currentTokens = tokens;
+            scheduleTokenRefresh(tokens);
+          }
+        } else if (type === 'REFRESH_FAILURE' || type === 'LOGOUT') {
+          clearStoredTokens();
+          currentUser = null;
+          notifyListeners(null);
+        }
+      };
+    } catch {
+      // BroadcastChannel unavailable in non-browser or sandboxed environments
+    }
+  }
+}
+
+initBroadcastChannel();
+
+function broadcastAuthEvent(type: 'REFRESH_SUCCESS' | 'REFRESH_FAILURE' | 'LOGOUT'): void {
+  if (broadcastChannel) {
+    try {
+      // Broadcast event notification without logging or transmitting sensitive raw tokens
+      broadcastChannel.postMessage({ type, timestamp: Date.now() });
+    } catch {
+      // ignore
+    }
+  }
+}
 
 // ---------------------------------------------------------------------------
 // HELPERS
@@ -152,7 +200,7 @@ function getTokenExpiry(token: string): number {
   }
 }
 
-function storeTokens(tokens: AuthTokens): void {
+export function storeTokens(tokens: AuthTokens): void {
   currentTokens = tokens;
   try {
     localStorage.setItem(TOKEN_KEY, JSON.stringify(tokens));
@@ -161,7 +209,7 @@ function storeTokens(tokens: AuthTokens): void {
   }
 }
 
-function clearStoredTokens(): void {
+export function clearStoredTokens(): void {
   currentTokens = null;
   try {
     localStorage.removeItem(TOKEN_KEY);
@@ -273,28 +321,47 @@ export async function logout(): Promise<void> {
     refreshTimer = null;
   }
 
+  broadcastAuthEvent('LOGOUT');
   notifyListeners(null);
 }
 
+/**
+ * Single-flight token refresh with cross-tab notification
+ * Deduplicates overlapping refresh calls and clears in-flight state on completion/failure.
+ */
 export async function refreshTokens(): Promise<AuthTokens | null> {
+  // 1. Single-flight: Return existing in-flight promise if a refresh is already underway
+  if (inFlightRefreshPromise) {
+    return inFlightRefreshPromise;
+  }
+
   const tokens = currentTokens || loadStoredTokens();
   if (!tokens?.refreshToken) return null;
 
-  try {
-    const response = await post<{ tokens: AuthTokens }>('/auth/refresh', {
-      refreshToken: tokens.refreshToken,
-    });
+  inFlightRefreshPromise = (async () => {
+    try {
+      const response = await post<{ tokens: AuthTokens }>('/auth/refresh', {
+        refreshToken: tokens.refreshToken,
+      });
 
-    storeTokens(response.data.tokens);
-    scheduleTokenRefresh(response.data.tokens);
+      storeTokens(response.data.tokens);
+      scheduleTokenRefresh(response.data.tokens);
+      broadcastAuthEvent('REFRESH_SUCCESS');
 
-    return response.data.tokens;
-  } catch {
-    clearStoredTokens();
-    currentUser = null;
-    notifyListeners(null);
-    return null;
-  }
+      return response.data.tokens;
+    } catch {
+      clearStoredTokens();
+      currentUser = null;
+      notifyListeners(null);
+      broadcastAuthEvent('REFRESH_FAILURE');
+      return null;
+    } finally {
+      // Clear in-flight promise so future refresh attempts can execute cleanly
+      inFlightRefreshPromise = null;
+    }
+  })();
+
+  return inFlightRefreshPromise;
 }
 
 export async function getCurrentUser(): Promise<User | null> {
