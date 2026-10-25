@@ -129,6 +129,17 @@ let currentTokens: AuthTokens | null = null;
 let currentUser: User | null = null;
 let refreshTimer: number | null = null;
 let authListeners: Array<(user: User | null) => void> = [];
+let refreshPromise: Promise<AuthTokens | null> | null = null;
+
+const authChannel = new BroadcastChannel('tot_auth_channel');
+
+authChannel.onmessage = (event) => {
+  if (event.data.type === 'TOKEN_REFRESHED') {
+    const tokens = event.data.tokens;
+    storeTokens(tokens);
+    scheduleTokenRefresh(tokens);
+  }
+};
 
 // ---------------------------------------------------------------------------
 // HELPERS
@@ -277,24 +288,39 @@ export async function logout(): Promise<void> {
 }
 
 export async function refreshTokens(): Promise<AuthTokens | null> {
+  if (refreshPromise) return refreshPromise;
+
   const tokens = currentTokens || loadStoredTokens();
   if (!tokens?.refreshToken) return null;
 
-  try {
-    const response = await post<{ tokens: AuthTokens }>('/auth/refresh', {
-      refreshToken: tokens.refreshToken,
-    });
+  refreshPromise = (async () => {
+    try {
+      const response = await post<{ tokens: AuthTokens }>('/auth/refresh', {
+        refreshToken: tokens.refreshToken,
+      });
 
-    storeTokens(response.data.tokens);
-    scheduleTokenRefresh(response.data.tokens);
+      const newTokens = response.data.tokens;
+      storeTokens(newTokens);
+      scheduleTokenRefresh(newTokens);
 
-    return response.data.tokens;
-  } catch {
-    clearStoredTokens();
-    currentUser = null;
-    notifyListeners(null);
-    return null;
-  }
+      // Notify other tabs that tokens have been refreshed
+      authChannel.postMessage({
+        type: 'TOKEN_REFRESHED',
+        tokens: newTokens,
+      });
+
+      return newTokens;
+    } catch {
+      clearStoredTokens();
+      currentUser = null;
+      notifyListeners(null);
+      return null;
+    } finally {
+      refreshPromise = null;
+    }
+  })();
+
+  return refreshPromise;
 }
 
 export async function getCurrentUser(): Promise<User | null> {
