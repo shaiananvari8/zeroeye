@@ -85,6 +85,14 @@ python3 build.py --module backend,frontend  # Build specific modules
 python3 build.py --release    # Release mode (Rust only)
 ```
 
+### Auth refresh validation
+
+With Node.js 22.13 or later, run `npm run test:auth-refresh --prefix frontend`.
+The dependency-free tests evaluate the real auth module in isolated browser-like
+contexts with controlled API responses, shared storage and Web Locks. They cover
+same-tab and cross-tab success/failure, retry cleanup, transport fallbacks and
+stale responses after logout/login. They do not contact the authentication server.
+
 ### Build diagnostics
 
 Each build writes a diagnostic bundle into the git-tracked `diagnostic/` directory. The encrypted log is named from the current commit's first 4 bytes, so it remains constant for the same commit: `build-<commit-4-bytes>.logd` (for example, `build-1a2b3c4d.logd`). It is accompanied by matching metadata (`build-<commit-4-bytes>-metadata.json`) that includes the decrypt password and module results.

@@ -9,9 +9,13 @@
  * - SSO (SAML, OpenID Connect)
  * - API key authentication for machine-to-machine
  *
- * TODO: The token refresh logic has a race condition when multiple tabs
- * try to refresh simultaneously. The fix involves a shared worker or
- * broadcast channel coordination.
+ * Refresh callers share one in-flight promise per tab. Web Locks serialize
+ * refreshes across tabs; waiters reload the stored result instead of rotating
+ * the same credential twice. BroadcastChannel sends only completion/failure
+ * notifications; token values remain in the existing token store.
+ * Without Web Locks, in-tab deduplication and storage-event synchronization
+ * still work, but simultaneous cross-tab requests cannot be serialized.
+ * If storage is disabled, coordination is limited to the current tab.
  */
 
 import { get, post, del } from './api';
@@ -123,11 +127,16 @@ export interface Session {
 
 const TOKEN_KEY = 'tot_auth_tokens';
 const USER_KEY = 'tot_user_data';
+const REFRESH_LOCK = 'tot_auth_refresh';
 const REFRESH_THRESHOLD = 60; // seconds before expiry to attempt refresh
 
 let currentTokens: AuthTokens | null = null;
+let tokensPersisted = false;
 let currentUser: User | null = null;
 let refreshTimer: number | null = null;
+let refreshInFlight: Promise<AuthTokens | null> | null = null;
+let sessionVersion = 0;
+let refreshChannel: BroadcastChannel | null = null;
 let authListeners: Array<(user: User | null) => void> = [];
 
 // ---------------------------------------------------------------------------
@@ -154,8 +163,11 @@ function getTokenExpiry(token: string): number {
 
 function storeTokens(tokens: AuthTokens): void {
   currentTokens = tokens;
+  tokensPersisted = false;
+  sessionVersion++;
   try {
     localStorage.setItem(TOKEN_KEY, JSON.stringify(tokens));
+    tokensPersisted = true;
   } catch {
     // localStorage may be unavailable in some environments
   }
@@ -163,6 +175,9 @@ function storeTokens(tokens: AuthTokens): void {
 
 function clearStoredTokens(): void {
   currentTokens = null;
+  tokensPersisted = false;
+  sessionVersion++;
+  stopRefreshTimer();
   try {
     localStorage.removeItem(TOKEN_KEY);
     localStorage.removeItem(USER_KEY);
@@ -171,20 +186,73 @@ function clearStoredTokens(): void {
   }
 }
 
-function loadStoredTokens(): AuthTokens | null {
+function readStoredTokens(): { available: boolean; tokens: AuthTokens | null } {
   try {
-    const stored = localStorage.getItem(TOKEN_KEY);
-    if (stored) {
-      const tokens = JSON.parse(stored) as AuthTokens;
-      if (!isTokenExpired(tokens.accessToken)) {
-        currentTokens = tokens;
-        return tokens;
-      }
-    }
+    const value = localStorage.getItem(TOKEN_KEY);
+    const tokens = value ? JSON.parse(value) : null;
+    return { available: true, tokens: tokens &&
+      typeof tokens.accessToken === 'string' && typeof tokens.refreshToken === 'string' &&
+      Number.isFinite(tokens.expiresIn) && tokens.expiresIn > 0 ? tokens : null };
   } catch {
-    // ignore
+    return { available: false, tokens: null };
+  }
+}
+
+function loadStoredTokens(): AuthTokens | null {
+  const { tokens } = readStoredTokens();
+  if (tokens && !isTokenExpired(tokens.accessToken)) {
+    currentTokens = tokens;
+    tokensPersisted = true;
+    return tokens;
   }
   return null;
+}
+
+function stopRefreshTimer(): void {
+  if (refreshTimer !== null) clearTimeout(refreshTimer);
+  refreshTimer = null;
+}
+
+function sameTokens(a: AuthTokens | null, b: AuthTokens | null): boolean {
+  return a?.accessToken === b?.accessToken && a?.refreshToken === b?.refreshToken;
+}
+
+function synchronizeStoredSession(): void {
+  const stored = readStoredTokens();
+  if (!stored.available || sameTokens(currentTokens, stored.tokens)) return;
+  currentTokens = stored.tokens;
+  tokensPersisted = stored.tokens !== null;
+  sessionVersion++;
+  stopRefreshTimer();
+  currentUser = null;
+  if (stored.tokens) {
+    try { currentUser = JSON.parse(localStorage.getItem(USER_KEY) || 'null'); } catch { /* unavailable */ }
+    scheduleTokenRefresh(stored.tokens);
+  }
+  notifyListeners(currentUser);
+}
+
+function publishRefresh(type: 'refresh:success' | 'refresh:failure'): void {
+  // Never broadcast credentials, error bodies or a replacement session.
+  try { refreshChannel?.postMessage({ type }); } catch { /* storage events remain the fallback */ }
+}
+
+if (typeof window !== 'undefined') {
+  window.addEventListener('storage', event => {
+    if (event.key === TOKEN_KEY || event.key === null) synchronizeStoredSession();
+  });
+  try {
+    if (typeof BroadcastChannel !== 'undefined') {
+      refreshChannel = new BroadcastChannel(REFRESH_LOCK);
+      refreshChannel.onmessage = event => {
+        if (event.data?.type === 'refresh:success' || event.data?.type === 'refresh:failure') {
+          // Re-read authoritative storage: delayed or forged messages cannot
+          // overwrite a newer login, nor can their payload supply credentials.
+          synchronizeStoredSession();
+        }
+      };
+    }
+  } catch { /* storage events work when BroadcastChannel is unavailable */ }
 }
 
 function notifyListeners(user: User | null): void {
@@ -259,42 +327,80 @@ export async function register(request: RegisterRequest): Promise<AuthTokens> {
 }
 
 export async function logout(): Promise<void> {
+  // Invalidate pending refreshes before awaiting the network logout.
+  clearStoredTokens();
+  currentUser = null;
+  notifyListeners(null);
   try {
     await del('/auth/logout');
   } catch {
-    // Silently ignore logout errors - we clear local state regardless
+    // Local logout succeeds even when the server cannot be reached.
   }
-
-  clearStoredTokens();
-  currentUser = null;
-
-  if (refreshTimer !== null) {
-    clearTimeout(refreshTimer);
-    refreshTimer = null;
-  }
-
-  notifyListeners(null);
 }
 
-export async function refreshTokens(): Promise<AuthTokens | null> {
-  const tokens = currentTokens || loadStoredTokens();
-  if (!tokens?.refreshToken) return null;
-
-  try {
-    const response = await post<{ tokens: AuthTokens }>('/auth/refresh', {
-      refreshToken: tokens.refreshToken,
-    });
-
-    storeTokens(response.data.tokens);
-    scheduleTokenRefresh(response.data.tokens);
-
-    return response.data.tokens;
-  } catch {
-    clearStoredTokens();
-    currentUser = null;
-    notifyListeners(null);
-    return null;
+export function refreshTokens(): Promise<AuthTokens | null> {
+  if (refreshInFlight) return refreshInFlight;
+  const stored = readStoredTokens();
+  // A storage event may still be queued after another tab logged out. Only
+  // trust absence as invalidation if this tab previously persisted its tokens;
+  // failed writes (e.g. quota errors) must retain the memory-only fallback.
+  if (tokensPersisted && stored.available && !sameTokens(currentTokens, stored.tokens)) {
+    synchronizeStoredSession();
+    return Promise.resolve(currentTokens);
   }
+  // An expired access token can still carry a usable refresh credential.
+  const tokens = currentTokens || readStoredTokens().tokens;
+  if (!tokens?.refreshToken) return Promise.resolve(null);
+  const version = sessionVersion;
+  const persisted = readStoredTokens();
+
+  const superseded = (): boolean => {
+    if (sessionVersion !== version) return true;
+    const latest = readStoredTokens();
+    if (persisted.available && latest.available &&
+        (!sameTokens(persisted.tokens, latest.tokens) ||
+         (tokensPersisted && latest.tokens !== null && !sameTokens(tokens, latest.tokens)))) {
+      // A lock holder or a new login already changed the session, even if
+      // the asynchronous storage notification has not reached this tab yet.
+      synchronizeStoredSession();
+      return true;
+    }
+    return false;
+  };
+
+  const renew = async (): Promise<AuthTokens | null> => {
+    if (superseded()) return currentTokens;
+    try {
+      const response = await post<{ tokens: AuthTokens }>('/auth/refresh', {
+        refreshToken: tokens.refreshToken,
+      });
+      if (superseded()) return currentTokens;
+      storeTokens(response.data.tokens);
+      scheduleTokenRefresh(response.data.tokens);
+      publishRefresh('refresh:success');
+      return response.data.tokens;
+    } catch {
+      // Do not clear a new login or restore a session after logout.
+      if (superseded()) return currentTokens;
+      clearStoredTokens();
+      currentUser = null;
+      notifyListeners(null);
+      publishRefresh('refresh:failure');
+      return null;
+    }
+  };
+
+  const operation = Promise.resolve().then(() => {
+    if (typeof navigator !== 'undefined' && navigator.locks?.request) {
+      return navigator.locks.request(REFRESH_LOCK, renew);
+    }
+    return renew();
+  });
+  const pending = operation.finally(() => {
+    if (refreshInFlight === pending) refreshInFlight = null;
+  });
+  refreshInFlight = pending;
+  return pending;
 }
 
 export async function getCurrentUser(): Promise<User | null> {
