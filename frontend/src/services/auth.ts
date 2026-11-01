@@ -130,6 +130,50 @@ let currentUser: User | null = null;
 let refreshTimer: number | null = null;
 let authListeners: Array<(user: User | null) => void> = [];
 
+// Single-flight in-flight promise and cross-tab sync coordination
+let refreshInFlight: Promise<AuthTokens | null> | null = null;
+const AUTH_SYNC_CHANNEL = 'tot_auth_sync';
+let authChannel: BroadcastChannel | null = null;
+
+function getAuthChannel(): BroadcastChannel | null {
+  if (typeof BroadcastChannel !== 'undefined') {
+    if (!authChannel) {
+      try {
+        authChannel = new BroadcastChannel(AUTH_SYNC_CHANNEL);
+        authChannel.onmessage = (event: MessageEvent) => {
+          if (event.data?.type === 'REFRESH_SUCCESS') {
+            const reloaded = loadStoredTokens();
+            if (reloaded) {
+              currentTokens = reloaded;
+              scheduleTokenRefresh(reloaded);
+            }
+          } else if (event.data?.type === 'REFRESH_FAILURE') {
+            clearStoredTokens();
+            currentUser = null;
+            notifyListeners(null);
+          }
+        };
+      } catch {
+        authChannel = null;
+      }
+    }
+    return authChannel;
+  }
+  return null;
+}
+
+function broadcastAuthSync(type: 'REFRESH_SUCCESS' | 'REFRESH_FAILURE'): void {
+  try {
+    const channel = getAuthChannel();
+    if (channel) {
+      // Safe cross-tab propagation without emitting raw tokens
+      channel.postMessage({ type, timestamp: Date.now() });
+    }
+  } catch {
+    // Fallback or ignore in non-browser environments
+  }
+}
+
 // ---------------------------------------------------------------------------
 // HELPERS
 // ---------------------------------------------------------------------------
@@ -277,24 +321,41 @@ export async function logout(): Promise<void> {
 }
 
 export async function refreshTokens(): Promise<AuthTokens | null> {
+  // Concurrent callers share the single in-flight operation
+  if (refreshInFlight) {
+    return refreshInFlight;
+  }
+
   const tokens = currentTokens || loadStoredTokens();
   if (!tokens?.refreshToken) return null;
 
-  try {
-    const response = await post<{ tokens: AuthTokens }>('/auth/refresh', {
-      refreshToken: tokens.refreshToken,
-    });
+  refreshInFlight = (async () => {
+    try {
+      const response = await post<{ tokens: AuthTokens }>('/auth/refresh', {
+        refreshToken: tokens.refreshToken,
+      });
 
-    storeTokens(response.data.tokens);
-    scheduleTokenRefresh(response.data.tokens);
+      storeTokens(response.data.tokens);
+      scheduleTokenRefresh(response.data.tokens);
+      broadcastAuthSync('REFRESH_SUCCESS');
 
-    return response.data.tokens;
-  } catch {
-    clearStoredTokens();
-    currentUser = null;
-    notifyListeners(null);
-    return null;
-  }
+      return response.data.tokens;
+    } catch {
+      clearStoredTokens();
+      currentUser = null;
+      notifyListeners(null);
+      broadcastAuthSync('REFRESH_FAILURE');
+      return null;
+    } finally {
+      refreshInFlight = null;
+    }
+  })();
+
+  return refreshInFlight;
+}
+
+export function _resetRefreshState(): void {
+  refreshInFlight = null;
 }
 
 export async function getCurrentUser(): Promise<User | null> {
