@@ -130,6 +130,28 @@ let currentUser: User | null = null;
 let refreshTimer: number | null = null;
 let authListeners: Array<(user: User | null) => void> = [];
 
+// Single-flight refresh state and cross-tab BroadcastChannel
+let inFlightRefresh: Promise<AuthTokens | null> | null = null;
+const AUTH_SYNC_CHANNEL = 'tot_auth_sync';
+let authChannel: BroadcastChannel | null = null;
+try {
+  if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
+    authChannel = new BroadcastChannel(AUTH_SYNC_CHANNEL);
+    authChannel.onmessage = (event) => {
+      if (event.data?.type === 'REFRESH_SUCCESS') {
+        currentTokens = loadStoredTokens();
+        notifyListeners(currentUser);
+      } else if (event.data?.type === 'REFRESH_FAILURE') {
+        clearStoredTokens();
+        currentUser = null;
+        notifyListeners(null);
+      }
+    };
+  }
+} catch {
+  // Graceful fallback for non-browser environments
+}
+
 // ---------------------------------------------------------------------------
 // HELPERS
 // ---------------------------------------------------------------------------
@@ -277,24 +299,43 @@ export async function logout(): Promise<void> {
 }
 
 export async function refreshTokens(): Promise<AuthTokens | null> {
-  const tokens = currentTokens || loadStoredTokens();
-  if (!tokens?.refreshToken) return null;
-
-  try {
-    const response = await post<{ tokens: AuthTokens }>('/auth/refresh', {
-      refreshToken: tokens.refreshToken,
-    });
-
-    storeTokens(response.data.tokens);
-    scheduleTokenRefresh(response.data.tokens);
-
-    return response.data.tokens;
-  } catch {
-    clearStoredTokens();
-    currentUser = null;
-    notifyListeners(null);
-    return null;
+  if (inFlightRefresh) {
+    return inFlightRefresh;
   }
+
+  inFlightRefresh = (async () => {
+    const tokens = currentTokens || loadStoredTokens();
+    if (!tokens?.refreshToken) return null;
+
+    try {
+      const response = await post<{ tokens: AuthTokens }>('/auth/refresh', {
+        refreshToken: tokens.refreshToken,
+      });
+
+      storeTokens(response.data.tokens);
+      scheduleTokenRefresh(response.data.tokens);
+
+      if (authChannel) {
+        authChannel.postMessage({ type: 'REFRESH_SUCCESS' });
+      }
+
+      return response.data.tokens;
+    } catch {
+      clearStoredTokens();
+      currentUser = null;
+      notifyListeners(null);
+
+      if (authChannel) {
+        authChannel.postMessage({ type: 'REFRESH_FAILURE' });
+      }
+
+      return null;
+    } finally {
+      inFlightRefresh = null;
+    }
+  })();
+
+  return inFlightRefresh;
 }
 
 export async function getCurrentUser(): Promise<User | null> {
