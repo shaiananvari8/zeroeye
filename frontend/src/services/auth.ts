@@ -9,12 +9,13 @@
  * - SSO (SAML, OpenID Connect)
  * - API key authentication for machine-to-machine
  *
- * TODO: The token refresh logic has a race condition when multiple tabs
- * try to refresh simultaneously. The fix involves a shared worker or
- * broadcast channel coordination.
+ * Token renewal is single-flight per tab; Web Locks serialize refreshes
+ * across tabs where supported, with a best-effort storage lease fallback.
+ * Cross-tab events contain no access or refresh token values.
  */
 
-import { get, post, del } from './api';
+import { get, post, del, put } from './api';
+import { createRefreshCoordinator, type RefreshEvent } from './refreshCoordinator';
 
 // ---------------------------------------------------------------------------
 // TYPES
@@ -171,6 +172,23 @@ function clearStoredTokens(): void {
   }
 }
 
+// Use persisted refresh credentials even when the access JWT is expired.
+function readRefreshableTokens(): AuthTokens | null {
+  try {
+    const raw = localStorage.getItem(TOKEN_KEY);
+    if (raw) {
+      const tokens = JSON.parse(raw) as AuthTokens;
+      return tokens?.refreshToken && tokens?.accessToken ? tokens : null;
+    }
+    // Missing persisted credentials are authoritative: another tab may
+    // have logged out. Never restore a stale in-memory token on a storage event.
+    return null;
+  } catch {
+    // Browsers may throw when storage access is blocked.
+    return currentTokens;
+  }
+}
+
 function loadStoredTokens(): AuthTokens | null {
   try {
     const stored = localStorage.getItem(TOKEN_KEY);
@@ -217,6 +235,80 @@ function scheduleTokenRefresh(tokens: AuthTokens): void {
     }
   }, refreshIn);
 }
+
+// Cross-tab completion notifications carry metadata only, never credentials.
+// A storage event also synchronizes tabs when BroadcastChannel is missing.
+const refreshTabId = typeof crypto !== 'undefined' && 'randomUUID' in crypto
+  ? crypto.randomUUID() : `tab-${Math.random().toString(36).slice(2)}`;
+let refreshChannel: BroadcastChannel | null = null;
+
+function syncSessionFromStorage(): void {
+  const latest = readRefreshableTokens();
+  currentTokens = latest;
+  if (latest) {
+    scheduleTokenRefresh(latest);
+  } else {
+    if (refreshTimer !== null) {
+      clearTimeout(refreshTimer);
+      refreshTimer = null;
+    }
+    currentUser = null;
+    notifyListeners(null);
+  }
+}
+
+function publishRefresh(event: RefreshEvent): void {
+  try {
+    refreshChannel?.postMessage({ type: `refresh:${event}`, source: refreshTabId });
+  } catch {
+    // The storage event path still works where BroadcastChannel is blocked.
+  }
+}
+
+function initializeCrossTabRefresh(): void {
+  if (typeof window === 'undefined') return;
+  window.addEventListener('storage', (event) => {
+    if (event.key === TOKEN_KEY) syncSessionFromStorage();
+  });
+  if (typeof BroadcastChannel !== 'undefined') {
+    try {
+      refreshChannel = new BroadcastChannel('tot_auth_refresh');
+      refreshChannel.onmessage = (event) => {
+        const data = event.data;
+        if (data?.source !== refreshTabId &&
+          (data?.type === 'refresh:success' || data?.type === 'refresh:failure')) {
+          syncSessionFromStorage();
+        }
+      };
+    } catch {
+      refreshChannel = null;
+    }
+  }
+}
+
+initializeCrossTabRefresh();
+
+const coordinateRefresh = createRefreshCoordinator<AuthTokens>({
+  read: readRefreshableTokens,
+  request: async (tokens) => {
+    const response = await post<{ tokens: AuthTokens }>('/auth/refresh', {
+      refreshToken: tokens.refreshToken,
+    });
+    return response.data.tokens;
+  },
+  save: (tokens) => {
+    storeTokens(tokens);
+    scheduleTokenRefresh(tokens);
+  },
+  clear: () => {
+    clearStoredTokens();
+    currentUser = null;
+    notifyListeners(null);
+  },
+  publish: publishRefresh,
+  locks: () => typeof navigator !== 'undefined' ? navigator.locks : undefined,
+  storage: () => typeof localStorage !== 'undefined' ? localStorage : undefined,
+});
 
 // ---------------------------------------------------------------------------
 // PUBLIC API
@@ -276,25 +368,8 @@ export async function logout(): Promise<void> {
   notifyListeners(null);
 }
 
-export async function refreshTokens(): Promise<AuthTokens | null> {
-  const tokens = currentTokens || loadStoredTokens();
-  if (!tokens?.refreshToken) return null;
-
-  try {
-    const response = await post<{ tokens: AuthTokens }>('/auth/refresh', {
-      refreshToken: tokens.refreshToken,
-    });
-
-    storeTokens(response.data.tokens);
-    scheduleTokenRefresh(response.data.tokens);
-
-    return response.data.tokens;
-  } catch {
-    clearStoredTokens();
-    currentUser = null;
-    notifyListeners(null);
-    return null;
-  }
+export function refreshTokens(): Promise<AuthTokens | null> {
+  return coordinateRefresh();
 }
 
 export async function getCurrentUser(): Promise<User | null> {
