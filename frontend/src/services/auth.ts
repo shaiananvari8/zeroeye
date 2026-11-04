@@ -180,9 +180,9 @@ function readRefreshableTokens(): AuthTokens | null {
       const tokens = JSON.parse(raw) as AuthTokens;
       return tokens?.refreshToken && tokens?.accessToken ? tokens : null;
     }
-    // Storage may silently reject writes; preserve an in-memory session then.
-    // A real logout clears currentTokens along with the persisted credentials.
-    return currentTokens;
+    // Missing persisted credentials are authoritative: another tab may
+    // have logged out. Never restore a stale in-memory token on a storage event.
+    return null;
   } catch {
     // Browsers may throw when storage access is blocked.
     return currentTokens;
