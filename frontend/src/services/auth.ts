@@ -9,9 +9,10 @@
  * - SSO (SAML, OpenID Connect)
  * - API key authentication for machine-to-machine
  *
- * TODO: The token refresh logic has a race condition when multiple tabs
- * try to refresh simultaneously. The fix involves a shared worker or
- * broadcast channel coordination.
+ * Single-flight token refresh coordination is implemented:
+ * - Concurrent in-tab calls coalesce onto a single in-flight Promise.
+ * - Cross-tab calls synchronize via BroadcastChannel and localStorage events.
+ * - In-flight markers are deterministically cleared on both success and failure.
  */
 
 import { get, post, del } from './api';
@@ -129,6 +130,142 @@ let currentTokens: AuthTokens | null = null;
 let currentUser: User | null = null;
 let refreshTimer: number | null = null;
 let authListeners: Array<(user: User | null) => void> = [];
+
+// ---------------------------------------------------------------------------
+// SINGLE-FLIGHT & CROSS-TAB COORDINATION
+// ---------------------------------------------------------------------------
+
+const REFRESH_IN_FLIGHT_KEY = 'tot_auth_refresh_in_flight';
+const REFRESH_BROADCAST_CHANNEL = 'tot_auth_refresh';
+const REFRESH_IN_FLIGHT_TTL_MS = 30_000;
+
+type RefreshBroadcastMessage = {
+  type: 'refresh-complete' | 'refresh-failed';
+  refreshId: string;
+};
+
+let refreshInFlight: Promise<AuthTokens | null> | null = null;
+let refreshChannel: BroadcastChannel | null = null;
+
+function getRefreshChannel(): BroadcastChannel | null {
+  if (refreshChannel) return refreshChannel;
+  if (typeof BroadcastChannel === 'undefined') return null;
+  try {
+    refreshChannel = new BroadcastChannel(REFRESH_BROADCAST_CHANNEL);
+    return refreshChannel;
+  } catch {
+    return null;
+  }
+}
+
+function createRefreshId(): string {
+  if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
+    return crypto.randomUUID();
+  }
+  return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+function readRefreshMarker(): { refreshId: string; expiresAt: number } | null {
+  try {
+    if (typeof localStorage === 'undefined') return null;
+    const raw = localStorage.getItem(REFRESH_IN_FLIGHT_KEY);
+    if (!raw) return null;
+    const marker = JSON.parse(raw) as { refreshId: string; expiresAt: number };
+    if (!marker.refreshId || Date.now() >= marker.expiresAt) {
+      localStorage.removeItem(REFRESH_IN_FLIGHT_KEY);
+      return null;
+    }
+    return marker;
+  } catch {
+    return null;
+  }
+}
+
+function writeRefreshMarker(refreshId: string): void {
+  try {
+    if (typeof localStorage === 'undefined') return;
+    localStorage.setItem(REFRESH_IN_FLIGHT_KEY, JSON.stringify({
+      refreshId,
+      expiresAt: Date.now() + REFRESH_IN_FLIGHT_TTL_MS,
+    }));
+  } catch {
+    // localStorage coordination is best effort; same-tab single-flight still applies
+  }
+}
+
+function clearRefreshMarker(refreshId: string): void {
+  try {
+    if (typeof localStorage === 'undefined') return;
+    const marker = readRefreshMarker();
+    if (!marker || marker.refreshId === refreshId) {
+      localStorage.removeItem(REFRESH_IN_FLIGHT_KEY);
+    }
+  } catch {
+    // ignore cleanup errors
+  }
+}
+
+function broadcastRefresh(message: RefreshBroadcastMessage): void {
+  try {
+    getRefreshChannel()?.postMessage(message);
+  } catch {
+    // BroadcastChannel may be unavailable or closed. The storage event fallback below still fires.
+  }
+  try {
+    if (typeof localStorage !== 'undefined') {
+      localStorage.setItem(`${REFRESH_BROADCAST_CHANNEL}:last`, JSON.stringify({
+        ...message,
+        notifiedAt: Date.now(),
+      }));
+    }
+  } catch {
+    // ignore fallback notification errors
+  }
+}
+
+function waitForCrossTabRefresh(refreshId: string): Promise<AuthTokens | null> {
+  return new Promise(resolve => {
+    let settled = false;
+    let timeoutId: number | null = null;
+
+    const settle = (failed: boolean): void => {
+      if (settled) return;
+      settled = true;
+      if (timeoutId !== null && typeof window !== 'undefined') window.clearTimeout(timeoutId);
+      if (typeof window !== 'undefined') {
+        getRefreshChannel()?.removeEventListener('message', onBroadcast);
+        window.removeEventListener('storage', onStorage);
+      }
+      resolve(failed ? null : loadStoredTokens());
+    };
+
+    const onMessage = (message: RefreshBroadcastMessage): void => {
+      if (message.refreshId !== refreshId) return;
+      settle(message.type === 'refresh-failed');
+    };
+
+    const onBroadcast = (event: MessageEvent<RefreshBroadcastMessage>): void => {
+      onMessage(event.data);
+    };
+
+    const onStorage = (event: StorageEvent): void => {
+      if (event.key !== `${REFRESH_BROADCAST_CHANNEL}:last` || !event.newValue) return;
+      try {
+        onMessage(JSON.parse(event.newValue) as RefreshBroadcastMessage);
+      } catch {
+        // ignore unrelated storage values
+      }
+    };
+
+    if (typeof window !== 'undefined') {
+      getRefreshChannel()?.addEventListener('message', onBroadcast);
+      window.addEventListener('storage', onStorage);
+      timeoutId = window.setTimeout(() => settle(false), REFRESH_IN_FLIGHT_TTL_MS);
+    } else {
+      settle(false);
+    }
+  });
+}
 
 // ---------------------------------------------------------------------------
 // HELPERS
@@ -276,25 +413,56 @@ export async function logout(): Promise<void> {
   notifyListeners(null);
 }
 
+/**
+ * Refreshes auth tokens using a single-flight execution pattern.
+ *
+ * Concurrent callers in the same tab share the single in-flight Promise (`refreshInFlight`).
+ * Concurrent callers across tabs observe the cross-tab in-flight marker in localStorage
+ * and wait for notification via BroadcastChannel or storage event without initiating duplicate
+ * refresh requests. In-flight state and markers are guaranteed to be cleaned up in a `finally`
+ * block on both success and failure, allowing subsequent retries. Raw tokens are never logged
+ * or transmitted over broadcast events.
+ */
 export async function refreshTokens(): Promise<AuthTokens | null> {
   const tokens = currentTokens || loadStoredTokens();
   if (!tokens?.refreshToken) return null;
 
-  try {
-    const response = await post<{ tokens: AuthTokens }>('/auth/refresh', {
-      refreshToken: tokens.refreshToken,
-    });
+  // Single-flight coordination: same-tab callers reuse refreshInFlight, while
+  // other tabs wait for a token-free BroadcastChannel/storage completion signal.
+  if (refreshInFlight) return refreshInFlight;
 
-    storeTokens(response.data.tokens);
-    scheduleTokenRefresh(response.data.tokens);
-
-    return response.data.tokens;
-  } catch {
-    clearStoredTokens();
-    currentUser = null;
-    notifyListeners(null);
-    return null;
+  const existingMarker = readRefreshMarker();
+  if (existingMarker) {
+    return waitForCrossTabRefresh(existingMarker.refreshId);
   }
+
+  const refreshId = createRefreshId();
+  writeRefreshMarker(refreshId);
+
+  refreshInFlight = (async () => {
+    try {
+      const response = await post<{ tokens: AuthTokens }>('/auth/refresh', {
+        refreshToken: tokens.refreshToken,
+      });
+
+      storeTokens(response.data.tokens);
+      scheduleTokenRefresh(response.data.tokens);
+      broadcastRefresh({ type: 'refresh-complete', refreshId });
+
+      return response.data.tokens;
+    } catch {
+      clearStoredTokens();
+      currentUser = null;
+      notifyListeners(null);
+      broadcastRefresh({ type: 'refresh-failed', refreshId });
+      return null;
+    } finally {
+      clearRefreshMarker(refreshId);
+      refreshInFlight = null;
+    }
+  })();
+
+  return refreshInFlight;
 }
 
 export async function getCurrentUser(): Promise<User | null> {
