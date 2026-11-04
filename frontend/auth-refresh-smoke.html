@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Auth refresh: two-tab smoke test</title>
+  <style>
+    body { margin: 3rem auto; max-width: 650px; padding: 0 1rem; font: 16px system-ui; line-height: 1.5; }
+    button { padding: .7rem 1.1rem; font: inherit; cursor:pointer; }
+    #status { white-space: pre-wrap; background: #f3f4f6; border-radius:8px; padding:1rem; }
+  </style>
+</head>
+<body>
+  <h1>Cross-tab refresh smoke test</h1>
+  <p>Open <strong>this exact page in two tabs</strong>, then press “Run test” in either tab. The second tab participates automatically. Only fake test credentials are used; do not run alongside a real signed-in session. Requires an active Vite dev server and a browser with Web Locks support.</p>
+  <p><button id="start">Run test in both tabs</button></p>
+  <p id="status" role="status">Ready. Open this page in two browser tabs.</p>
+  <script type="module">
+    import { createRefreshCoordinator } from '/src/services/refreshCoordinator.ts';
+
+    const key = 'tot_auth_refresh_smoke_session';
+    const callsKey = 'tot_auth_refresh_smoke_calls';
+    const name = 'tot_auth_refresh_smoke_channel';
+    const tabId = Math.random().toString(36).slice(2);
+    const channel = new BroadcastChannel(name);
+    const status = document.getElementById('status');
+    const button = document.getElementById('start');
+    const initial = { accessToken: 'demo-access-before', refreshToken: 'demo-refresh-before' };
+    const renewed = { accessToken: 'demo-access-after', refreshToken: 'demo-refresh-after' };
+    const reports = new Map();
+
+    function read() {
+      try { return JSON.parse(localStorage.getItem(key) || 'null'); } catch { return null; }
+    }
+    function show(message) { status.textContent = message; }
+    const refresh = createRefreshCoordinator({
+      read,
+      request: async () => {
+        localStorage.setItem(callsKey, String(Number(localStorage.getItem(callsKey) || 0) + 1));
+        await new Promise(resolve => setTimeout(resolve, 1600));
+        return renewed;
+      },
+      save: tokens => localStorage.setItem(key, JSON.stringify(tokens)),
+      clear: () => localStorage.removeItem(key),
+      publish: event => channel.postMessage({ type: 'refresh-event', event, tabId }),
+      locks: () => navigator.locks,
+      // Browser fallback is only best effort and is not tested by this page.
+      storage: () => localStorage,
+    });
+
+    async function participate(runId) {
+      show('Refreshing in both tabs…');
+      const result = await refresh();
+      const success = result?.accessToken === renewed.accessToken &&
+        result?.refreshToken === renewed.refreshToken;
+      reports.set(tabId, success);
+      channel.postMessage({ type: 'result', runId, tabId, success });
+      show(success ? 'This tab: PASS. Waiting for other tab result…'
+                   : 'This tab: FAIL. Check the browser console for errors.');
+      setTimeout(() => {
+        const count = Number(localStorage.getItem(callsKey) || 0);
+        const passed = success && reports.size >= 2 &&
+          [...reports.values()].every(Boolean) && count === 1;
+        show((passed ? 'PASS' : 'INCOMPLETE / FAIL') +
+          '\nParticipating tabs: ' + reports.size +
+          '\nMock network refresh calls (expected 1): ' + count +
+          '\nAll tab results successful: ' + [...reports.values()].every(Boolean) +
+          (reports.size < 2 ? '\nOpen the page in a second tab and run again.' : ''));
+        button.disabled = false;
+      }, 1900);
+    }
+
+    channel.addEventListener('message', event => {
+      const data = event.data;
+      if (data?.type === 'begin') {
+        reports.clear();
+        participate(data.runId).catch(error => show('Test failed: ' + error.message));
+      }
+      if (data?.type === 'result') reports.set(data.tabId, !!data.success);
+    });
+
+    button.addEventListener('click', () => {
+      if (!navigator.locks) { show('Web Locks are unavailable in this browser.'); return; }
+      button.disabled = true;
+      reports.clear();
+      const runId = Date.now().toString(36);
+      localStorage.setItem(key, JSON.stringify(initial));
+      localStorage.setItem(callsKey, '0');
+      channel.postMessage({ type: 'begin', runId });
+      participate(runId).catch(error => show('Test failed: ' + error.message));
+    });
+  </script>
+</body>
+</html>
