@@ -176,10 +176,15 @@ function clearStoredTokens(): void {
 function readRefreshableTokens(): AuthTokens | null {
   try {
     const raw = localStorage.getItem(TOKEN_KEY);
-    if (!raw) return null;
-    const tokens = JSON.parse(raw) as AuthTokens;
-    return tokens?.refreshToken && tokens?.accessToken ? tokens : null;
+    if (raw) {
+      const tokens = JSON.parse(raw) as AuthTokens;
+      return tokens?.refreshToken && tokens?.accessToken ? tokens : null;
+    }
+    // Storage may silently reject writes; preserve an in-memory session then.
+    // A real logout clears currentTokens along with the persisted credentials.
+    return currentTokens;
   } catch {
+    // Browsers may throw when storage access is blocked.
     return currentTokens;
   }
 }
