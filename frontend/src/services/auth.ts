@@ -130,6 +130,29 @@ let currentUser: User | null = null;
 let refreshTimer: number | null = null;
 let authListeners: Array<(user: User | null) => void> = [];
 
+let inFlightRefresh: Promise<AuthTokens | null> | null = null;
+
+const authChannel = new BroadcastChannel('auth_channel');
+authChannel.onmessage = (event) => {
+  if (event.data?.type === 'TOKEN_REFRESHED') {
+    // A different tab refreshed tokens successfully.
+    // We just reload them from local storage instead of making an API call.
+    loadStoredTokens();
+    if (currentTokens) {
+      scheduleTokenRefresh(currentTokens);
+    }
+  } else if (event.data?.type === 'LOGGED_OUT') {
+    // Another tab logged out
+    clearStoredTokens();
+    currentUser = null;
+    if (refreshTimer !== null) {
+      clearTimeout(refreshTimer);
+      refreshTimer = null;
+    }
+    notifyListeners(null);
+  }
+};
+
 // ---------------------------------------------------------------------------
 // HELPERS
 // ---------------------------------------------------------------------------
@@ -273,6 +296,7 @@ export async function logout(): Promise<void> {
     refreshTimer = null;
   }
 
+  authChannel.postMessage({ type: 'LOGGED_OUT' });
   notifyListeners(null);
 }
 
@@ -280,21 +304,34 @@ export async function refreshTokens(): Promise<AuthTokens | null> {
   const tokens = currentTokens || loadStoredTokens();
   if (!tokens?.refreshToken) return null;
 
-  try {
-    const response = await post<{ tokens: AuthTokens }>('/auth/refresh', {
-      refreshToken: tokens.refreshToken,
-    });
-
-    storeTokens(response.data.tokens);
-    scheduleTokenRefresh(response.data.tokens);
-
-    return response.data.tokens;
-  } catch {
-    clearStoredTokens();
-    currentUser = null;
-    notifyListeners(null);
-    return null;
+  if (inFlightRefresh) {
+    return inFlightRefresh;
   }
+
+  inFlightRefresh = (async () => {
+    try {
+      const response = await post<{ tokens: AuthTokens }>('/auth/refresh', {
+        refreshToken: tokens.refreshToken,
+      });
+
+      storeTokens(response.data.tokens);
+      scheduleTokenRefresh(response.data.tokens);
+      
+      authChannel.postMessage({ type: 'TOKEN_REFRESHED' });
+
+      inFlightRefresh = null;
+      return response.data.tokens;
+    } catch {
+      clearStoredTokens();
+      currentUser = null;
+      inFlightRefresh = null;
+      authChannel.postMessage({ type: 'LOGGED_OUT' });
+      notifyListeners(null);
+      return null;
+    }
+  })();
+
+  return inFlightRefresh;
 }
 
 export async function getCurrentUser(): Promise<User | null> {

@@ -78,7 +78,7 @@ RECOMMENDED_ALERT_RULES: List[Dict[str, Any]] = [
     },
     {
         "name": "HighMemoryUsage",
-        "expr": "process_resident_memory_bytes / process_resident_memory_bytes > 0.9",
+        "expr": "process_resident_memory_bytes / machine_memory_bytes > 0.9",
         "duration": "10m",
         "severity": "warning",
         "summary": "High memory usage on {{$labels.instance}}",
@@ -429,6 +429,16 @@ def main():
 
     if args.validate:
         print("Validating monitoring configuration...")
+        
+        all_ok = True
+        for rule in RECOMMENDED_ALERT_RULES:
+            expr = rule.get("expr", "")
+            if " / " in expr:
+                parts = [p.strip() for p in expr.split(">", 1)[0].split("<", 1)[0].split("==", 1)[0].split(" / ")]
+                if len(parts) == 2 and parts[0] == parts[1]:
+                    print(f"  VALIDATION FAILED: Rule '{rule['name']}' contains a self-dividing expression: {expr}")
+                    all_ok = False
+                    
         configs_to_check = [
             args.prometheus_url,
             args.alertmanager_url,
